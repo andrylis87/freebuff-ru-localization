@@ -1,0 +1,2839 @@
+From a22bb8018d570e3f823ac24eb10b0da6e8464255 Mon Sep 17 00:00:00 2001
+From: Freebuff <cloud@freebuff.local>
+Date: Mon, 26 Oct 2026 03:00:08 +0000
+Subject: [PATCH 1/5] i18n: add locale runtime, settings and /language switcher
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adds a dependency-free i18n core (t/tp/Intl formatters, zustand-backed
+locale state) plus the ru-RU catalog, persists the user's language in
+settings, auto-detects it from the environment on first launch, and exposes
+a /language command to switch. English stays at the call site as the
+fallback, so any untranslated key keeps rendering English.
+
+🤖 Generated with Codebuff
+Co-Authored-By: Codebuff <noreply@codebuff.com>
+---
+ cli/src/commands/command-registry.ts |  68 ++++++++
+ cli/src/i18n/detect.ts               |  74 ++++++++
+ cli/src/i18n/index.ts                | 251 +++++++++++++++++++++++++++
+ cli/src/i18n/locales/ru.ts           | 219 +++++++++++++++++++++++
+ cli/src/i18n/types.ts                |  29 ++++
+ cli/src/index.tsx                    |   5 +
+ cli/src/utils/settings.ts            |  23 +++
+ 7 files changed, 669 insertions(+)
+ create mode 100644 cli/src/i18n/detect.ts
+ create mode 100644 cli/src/i18n/index.ts
+ create mode 100644 cli/src/i18n/locales/ru.ts
+ create mode 100644 cli/src/i18n/types.ts
+
+diff --git a/cli/src/commands/command-registry.ts b/cli/src/commands/command-registry.ts
+index 3ca7b2c4..427ab4a2 100644
+--- a/cli/src/commands/command-registry.ts
++++ b/cli/src/commands/command-registry.ts
+@@ -39,6 +39,14 @@ import { handleUsageCommand } from './usage'
+ import { handleByokCommand } from './byok'
+ import { returnToFreebuffLanding } from '../hooks/use-freebuff-session'
+ import { useThemeStore } from '../hooks/use-theme'
++import {
++  getLocale,
++  listLocales,
++  LOCALE_LABELS,
++  parseLocale,
++  setLocale,
++  t,
++} from '../i18n'
+ import { LOGIN_WEBSITE_URL, WEBSITE_URL } from '../login/constants'
+ import { startNewChat } from '../project-files'
+ import { useChatStore } from '../state/chat-store'
+@@ -768,6 +776,66 @@ const ALL_COMMANDS: CommandDefinition[] = [
+       clearInput(params)
+     },
+   }),
++  defineCommandWithArgs({
++    // The language switcher. Works with no args (shows the current language
++    // and the list), `en`/`ru`, or any spelling of them (`RU`, `ru-RU`).
++    name: 'language',
++    aliases: ['lang', 'locale'],
++    handler: (params, args) => {
++      const requested = args.trim()
++      const available = listLocales()
++        .map(({ locale, label }) => `${locale} — ${label}`)
++        .join(', ')
++
++      // Echo the command the user typed, then one system line with the
++      // answer. The message is translated BEFORE it is posted, so after
++      // `/language ru` the confirmation itself comes back in Russian.
++      const respond = (message: string) => {
++        params.setMessages((prev) => [
++          ...prev,
++          getUserMessage(params.inputValue.trim()),
++          getSystemMessage(message),
++        ])
++        clearInput(params)
++      }
++
++      if (!requested) {
++        const current = getLocale()
++        respond(
++          t(
++            'lang.status',
++            'Interface language: {name} ({locale}). Available: {available}. Use /language <locale> to switch.',
++            {
++              name: LOCALE_LABELS[current],
++              locale: current,
++              available,
++            },
++          ),
++        )
++        return
++      }
++
++      const locale = parseLocale(requested)
++      if (!locale) {
++        respond(
++          t(
++            'lang.unsupported',
++            'Unsupported language "{value}". Available: {available}.',
++            { value: requested, available },
++          ),
++        )
++        return
++      }
++
++      setLocale(locale)
++      respond(
++        t('lang.changed', 'Interface language set to {name} ({locale}).', {
++          name: LOCALE_LABELS[locale],
++          locale,
++        }),
++      )
++    },
++  }),
+   defineCommand({
+     name: 'todo',
+     aliases: ['todos'],
+diff --git a/cli/src/i18n/detect.ts b/cli/src/i18n/detect.ts
+new file mode 100644
+index 00000000..8dcce61f
+--- /dev/null
++++ b/cli/src/i18n/detect.ts
+@@ -0,0 +1,74 @@
++/**
++ * Locale auto-detection for the CLI.
++ *
++ * Read straight from `process.env` rather than `getCliEnv()` on purpose: the
++ * CLI env snapshot is attached to telemetry payloads, and a user's `LANG` is
++ * neither needed nor wanted there. Nothing here is ever sent anywhere.
++ *
++ * Detection runs ONCE at startup (`initLocale`), and only decides anything
++ * when the user has no saved language — an explicit `/language` choice always
++ * wins over the environment.
++ */
++
++import { isLocale, type Locale } from './types'
++
++/** Explicit override, highest priority. Lets CI, tests and bug reports pin a
++ *  locale without touching settings: `FREEBUFF_LOCALE=ru`. */
++const OVERRIDE_VARS = ['FREEBUFF_LOCALE', 'CODEBUFF_LOCALE'] as const
++
++/** POSIX locale variables, most specific first (`LC_ALL` overrides
++ *  `LC_MESSAGES`, which overrides `LANG`). */
++const POSIX_VARS = ['LC_ALL', 'LC_MESSAGES', 'LANG'] as const
++
++/**
++ * Parse a locale-ish environment value into a supported locale.
++ *
++ * `ru_RU.UTF-8`, `ru`, `ru-RU.UTF-8@euro` → `ru`.
++ * Anything else that looks like a POSIX/BCP-47 tag → `en` (it names some
++ * other language, so Russian is not wanted). Empty/unset/garbage → `undefined`
++ * so the caller can keep looking instead of guessing `en` too early.
++ */
++const localeFromEnvValue = (raw: string | undefined): Locale | undefined => {
++  const value = raw?.trim()
++  if (!value) return undefined
++  // `C`, `POSIX` and `C.UTF-8` are the identity locales, not a language.
++  if (value === 'C' || value === 'POSIX') return undefined
++
++  const tag = value.split(/[.@]/)[0]?.replace('_', '-')
++  if (!tag) return undefined
++  if (!/^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})*$/.test(tag)) return undefined
++
++  return tag.toLowerCase().startsWith('ru') ? 'ru' : 'en'
++}
++
++/**
++ * Best-effort locale guess from the environment. Never throws: a weird
++ * environment must not be able to stop the CLI from starting.
++ */
++export const detectLocaleFromEnvironment = (): Locale | undefined => {
++  try {
++    for (const name of OVERRIDE_VARS) {
++      const parsed = isLocale(process.env[name])
++        ? process.env[name]
++        : localeFromEnvValue(process.env[name])
++      if (parsed) return parsed
++    }
++
++    for (const name of POSIX_VARS) {
++      const parsed = localeFromEnvValue(process.env[name])
++      // A POSIX var naming another language is a real answer: stop there so
++      // `LC_ALL=en_US.UTF-8` beats a ru-flavoured `LANG`.
++      if (parsed) return parsed
++    }
++
++    // ICU's own idea of the system locale — covers setups where no POSIX
++    // variable is exported at all. Weakest signal, so it goes last.
++    const resolved = Intl.DateTimeFormat().resolvedOptions().locale
++    if (resolved?.toLowerCase().startsWith('ru')) return 'ru'
++    if (resolved) return 'en'
++
++    return undefined
++  } catch {
++    return undefined
++  }
++}
+diff --git a/cli/src/i18n/index.ts b/cli/src/i18n/index.ts
+new file mode 100644
+index 00000000..0c37dcaf
+--- /dev/null
++++ b/cli/src/i18n/index.ts
+@@ -0,0 +1,251 @@
++/**
++ * Minimal i18n runtime for the Freebuff CLI.
++ *
++ * Design notes (deliberately small — no i18n dependency is added):
++ *
++ * - **English lives at the call site.** Every message is written in English
++ *   where it is used, as the `fallback` argument: `t('help.title', 'Keyboard
++ *   shortcuts')`. The `ru` catalog only stores overrides, so a missing key
++ *   falls back to English by construction and untranslated UI cannot render
++ *   as an empty string or a raw key.
++ * - **Locale is module state, not a React context.** `/language` changes it
++ *   once and every reader sees it; `useT()` subscribes React components to it
++ *   so the TUI re-renders, while plain `t()` works in non-React code
++ *   (command handlers, formatters) without a hook.
++ * - **Default is `en`.** The locale is only ever *initialized* explicitly at
++ *   startup (`initLocale`), so tests that assert English strings keep seeing
++ *   English regardless of the machine's `LANG`.
++ *
++ * See GLOSSARY_RU.md for the terminology the Russian catalog follows and
++ * README_RU.md for coverage and known limits.
++ */
++
++import { create } from 'zustand'
++
++import {
++  loadLanguagePreference,
++  saveLanguagePreference,
++} from '../utils/settings'
++import { detectLocaleFromEnvironment } from './detect'
++import { RU_MESSAGES } from './locales/ru'
++import {
++  DEFAULT_LOCALE,
++  SUPPORTED_LOCALES,
++  LOCALE_LABELS,
++  isLocale,
++  type Locale,
++} from './types'
++
++export type { Locale }
++export { LOCALE_LABELS, SUPPORTED_LOCALES }
++
++/** Values substituted into `{placeholders}`. */
++export type MessageParams = Record<string, string | number>
++
++/** English plural forms supplied inline at the call site. Russian forms come
++ *  from the catalog as `${key}.one|few|many|other`, so callers never have to
++ *  know Russian plural rules. */
++export interface PluralForms {
++  one?: string
++  other: string
++  few?: string
++  many?: string
++}
++
++export type TFunction = (
++  key: string,
++  fallback: string,
++  params?: MessageParams,
++) => string
++
++/** Catalogs per locale. Only non-English locales are stored (see file header). */
++const CATALOGS: Partial<Record<Locale, Record<string, string>>> = {
++  ru: RU_MESSAGES,
++}
++
++const useLocaleStore = create<{ locale: Locale }>(() => ({
++  locale: DEFAULT_LOCALE,
++}))
++
++let initialized = false
++
++/** The active locale. Safe to call from anywhere, including module scope. */
++export const getLocale = (): Locale => useLocaleStore.getState().locale
++
++/** React binding: re-renders the component whenever the locale changes. */
++export const useLocale = (): Locale => useLocaleStore((state) => state.locale)
++
++/** Whether `initLocale` (or `setLocale`) has run. */
++export const isLocaleInitialized = (): boolean => initialized
++
++/**
++ * Resolve the locale once, at startup.
++ *
++ * Precedence: saved `/language` choice → environment auto-detection → `en`.
++ * Calling it more than once is a no-op, so the user's choice can never be
++ * silently overwritten mid-session.
++ */
++export const initLocale = (): Locale => {
++  if (initialized) return getLocale()
++  initialized = true
++
++  const saved = loadLanguagePreference()
++  const locale = isLocale(saved)
++    ? saved
++    : (detectLocaleFromEnvironment() ?? DEFAULT_LOCALE)
++  useLocaleStore.setState({ locale })
++  return locale
++}
++
++/** Switch locale for this session and remember the choice. */
++export const setLocale = (locale: Locale): void => {
++  initialized = true
++  useLocaleStore.setState({ locale })
++  saveLanguagePreference(locale)
++}
++
++/** Reset to the startup default. Test-only seam; does not touch settings. */
++export const resetLocaleForTests = (): void => {
++  initialized = false
++  useLocaleStore.setState({ locale: DEFAULT_LOCALE })
++} /** `{name}` interpolation. Tokens with no matching param are left verbatim so
++ * a missing value is visible in the UI instead of vanishing as an empty
++ * string. `${...}`, `%s`, `%d` and HTML/Markdown are never touched. */
++const DOUBLE_BRACE = /{{([A-Za-z0-9_]+)}}/g
++// Deliberately no lookbehind here: JavaScriptCore (Bun) silently fails to
++// match a lookbehind whose character class mixes `{`, space and `$`, which
++// would turn interpolation into a no-op. Instead this pass matches any braced
++// token and the callback inspects the character in front of it, which keeps
++// `{{name}}` (handled above) and `${name}` (literal template syntax) intact.
++const BRACED = /\{([A-Za-z0-9_]+)\}/g
++
++const interpolate = (template: string, params?: MessageParams): string => {
++  if (!params) return template
++
++  const value = (name: string): string | undefined => {
++    const raw = params[name]
++    return raw === undefined ? undefined : String(raw)
++  }
++
++  const withDouble = template.replace(
++    DOUBLE_BRACE,
++    (match, name: string) => value(name) ?? match,
++  )
++
++  return withDouble.replace(BRACED, (match, name: string, offset: number) => {
++    const preceding = withDouble[offset - 1]
++    if (preceding === '{' || preceding === '$') return match
++    return value(name) ?? match
++  })
++}
++
++const lookup = (key: string, fallback: string): string => {
++  const locale = getLocale()
++  if (locale === DEFAULT_LOCALE) return fallback
++  return CATALOGS[locale]?.[key] ?? fallback
++}
++
++/**
++ * Translate `key`. Returns the English `fallback` when the locale is English
++ * or the key is missing from the active catalog.
++ *
++ * @example t('help.title', 'Keyboard shortcuts')
++ * @example t('lang.current', 'Interface language: {language}', { language })
++ */
++export const t: TFunction = (key, fallback, params) =>
++  interpolate(lookup(key, fallback), params)
++
++const pluralRules = new Map<Locale, Intl.PluralRules>()
++
++/** CLDR plural category for the locale: `one | few | many | other`. */
++const pluralCategory = (locale: Locale, count: number): Intl.LDMLPluralRule => {
++  let rules = pluralRules.get(locale)
++  if (!rules) {
++    rules = new Intl.PluralRules(locale)
++    pluralRules.set(locale, rules)
++  }
++  return rules.select(count)
++}
++
++/** English only needs `one`/`other`; the other categories exist so a caller
++ *  could supply them, and so this stays total over CLDR categories. */
++const englishForm = (
++  forms: PluralForms,
++  category: Intl.LDMLPluralRule,
++): string => {
++  if (category === 'one') return forms.one ?? forms.other
++  if (category === 'few') return forms.few ?? forms.other
++  if (category === 'many') return forms.many ?? forms.other
++  return forms.other
++}
++
++/**
++ * Plural-aware message. `count` is always available as `{count}`.
++ *
++ * Resolution order for the active locale: exact category form → `.other` →
++ * the English `forms` passed inline. Russian therefore gets its four forms
++ * from the catalog while English callers only write `one`/`other`.
++ *
++ * `{count}` is formatted through `Intl.NumberFormat` for non-English locales
++ * (so Russian renders `1 234 сообщения` and `1,5 файла`) and left as the raw
++ * number under `en`, where existing copy and its tests are byte-identical.
++ *
++ * @example tp('files.count', n, { one: '{count} file', other: '{count} files' })
++ */
++export const tp = (
++  key: string,
++  count: number,
++  forms: PluralForms,
++  params?: MessageParams,
++): string => {
++  const locale = getLocale()
++  const category = pluralCategory(locale, count)
++
++  let template: string | undefined
++  if (locale !== DEFAULT_LOCALE) {
++    const catalog = CATALOGS[locale]
++    template = catalog?.[`${key}.${category}`] ?? catalog?.[`${key}.other`]
++  }
++  template ??= englishForm(forms, category)
++
++  const renderedCount =
++    locale === DEFAULT_LOCALE
++      ? count
++      : new Intl.NumberFormat(locale === 'ru' ? 'ru-RU' : 'en-US').format(count)
++
++  return interpolate(template, { ...params, count: renderedCount })
++}
++
++const intlLocale = (): string => (getLocale() === 'ru' ? 'ru-RU' : 'en-US')
++
++/** Locale-aware number formatting. */
++export const formatNumber = (
++  value: number,
++  options?: Intl.NumberFormatOptions,
++): string => new Intl.NumberFormat(intlLocale(), options).format(value)
++
++/** Locale-aware date/time formatting. */
++export const formatDate = (
++  value: Date | number,
++  options?: Intl.DateTimeFormatOptions,
++): string => new Intl.DateTimeFormat(intlLocale(), options).format(value)
++
++/**
++ * React hook: subscribes the component to locale changes and returns `t`.
++ * Use this in components so a `/language` switch repaints them; plain `t()`
++ * is fine everywhere else.
++ */
++export const useT = (): TFunction => {
++  useLocaleStore((state) => state.locale)
++  return t
++}
++
++/** Every locale this build can switch to, with its self-name for the picker. */
++export const listLocales = (): { locale: Locale; label: string }[] =>
++  SUPPORTED_LOCALES.map((locale) => ({ locale, label: LOCALE_LABELS[locale] }))
++
++/** True when `value` names a locale this build ships (`ru`, `RU`, `ru-RU`). */
++export const parseLocale = (value: string): Locale | undefined => {
++  const tag = value.trim().split(/[._-]/)[0]?.toLowerCase()
++  return isLocale(tag) ? tag : undefined
++}
+diff --git a/cli/src/i18n/locales/ru.ts b/cli/src/i18n/locales/ru.ts
+new file mode 100644
+index 00000000..235f8a4a
+--- /dev/null
++++ b/cli/src/i18n/locales/ru.ts
+@@ -0,0 +1,219 @@
++/**
++ * Russian (ru-RU) message catalog.
++ *
++ * Flat dotted keys, one entry per UI string. English is NOT duplicated here:
++ * it lives at the call site as the `fallback` argument of `t()`, so a key
++ * missing from this file renders English by construction.
++ *
++ * Rules followed here — see GLOSSARY_RU.md:
++ *   - only user-facing strings; code, identifiers, CLI commands, paths, URLs,
++ *     model/provider/brand names and log lines stay in English;
++ *   - `{placeholders}` are copied verbatim, including their names;
++ *   - plural keys are `key.one` / `key.few` / `key.many` / `key.other`,
++ *     selected through `Intl.PluralRules('ru')`;
++ *   - «ё» is written out in full and quotation uses «…», per Russian
++ *     typography.
++ *
++ * `i18n/__tests__/locale-catalog.test.ts` enforces the mechanical half of
++ * this: no duplicate keys, well-formed keys, at least one Cyrillic letter per
++ * value, no stale keys, placeholder parity with the English source, and
++ * complete plural families.
++ *
++ * @see cli/src/i18n/index.ts for `t()` / `tp()`.
++ */
++
++export const RU_MESSAGES: Record<string, string> = {
++  // --- language switcher (/language) -------------------------------------
++  'lang.status':
++    'Язык интерфейса: {name} ({locale}). Доступны: {available}. Смена: /language <locale>.',
++  'lang.unsupported': 'Неподдерживаемый язык «{value}». Доступны: {available}.',
++  'lang.changed': 'Язык интерфейса переключён на {name} ({locale}).',
++
++  // --- slash command menu (cli/src/data/slash-commands.ts) ---------------
++  // Key = `cmd.<command id>.description`; the English source of truth is the
++  // `description:` literal for the same id in slash-commands.ts.
++  'cmd.ads:report.description':
++    'Сообщить о проблеме с рекламой: /ads:report <номер>, без аргумента — список недавних объявлений',
++  'cmd.help.description': 'Показать горячие клавиши и подсказки',
++  'cmd.diagnostics.description':
++    'Показать расход ресурсов CLI и PID запущенных инструментов',
++  'cmd.ads:enable.description': 'Включить контекстную рекламу',
++  'cmd.ads:disable.description': 'Выключить контекстную рекламу',
++  'cmd.init.description': 'Создать стартовый файл knowledge.md',
++  'cmd.usage.description': 'Показать баланс кредитов и лимит подписки',
++  'cmd.subscribe.description': 'Оформить подписку, чтобы увеличить лимит',
++  'cmd.interview.description':
++    'ИИ задаёт уточняющие вопросы, чтобы превратить запрос в спецификацию',
++  'cmd.plan.description': 'Составить план реализации запроса',
++  'cmd.review.description': 'Проверить изменения кода',
++  'cmd.queue.description':
++    'Изменить, переставить или удалить отложенные сообщения',
++  'cmd.todo.description': 'Показать текущий список задач и прогресс',
++  'cmd.new.description': 'Очистить историю и начать новый чат',
++  'cmd.history.description':
++    'Просматривать прошлые беседы и возвращаться к ним',
++  'cmd.copy.description':
++    'Скопировать всю беседу (сообщения и результаты инструментов) в буфер обмена',
++  'cmd.export.description':
++    'Сохранить беседу в файл (.md, либо .json с исходными сообщениями)',
++  'cmd.agent:gpt-5.description': 'Подключить агента GPT-5 для сложных задач',
++  'cmd.feedback.description': 'Поделиться отзывом о {brand}',
++  'cmd.bash.description': 'Режим bash — ввод с символом «!» в начале строки',
++  'cmd.image.description':
++    'Прикрепить изображение (или Ctrl+V из буфера обмена)',
++  'cmd.theme:toggle.description': 'Переключить светлую и тёмную темы',
++  'cmd.byok.description':
++    'Настройка прямого доступа к OpenRouter или OpenAI-compatible',
++  'cmd.model.description': 'Выбрать модель для следующего сообщения',
++  'cmd.reasoning.description': 'Выбрать уровень рассуждений для модели',
++  'cmd.deals.description':
++    'Партнёрские предложения: /deals use <номер> открывает одно, /deals off скрывает их',
++  'cmd.end-session.description': 'Завершить текущую сессию',
++  'cmd.dashboard.description':
++    'Открыть в браузере статистику, серию дней и аккаунт',
++  'cmd.logout.description': 'Выйти из аккаунта',
++  'cmd.exit.description': 'Выйти из CLI',
++  'cmd.language.description': 'Показать или сменить язык интерфейса',
++
++  // --- keyboard shortcut overlay (cli/src/components/help-banner.tsx) -----
++  'help.title': 'Горячие клавиши',
++  'help.section.compose': 'Ввод',
++  'help.section.chat': 'Чат',
++  'help.section.conversation': 'Беседа',
++  'help.compose.commands': 'Команды',
++  'help.compose.mention-files': 'Упомянуть файлы',
++  'help.compose.use-agent': 'Выбрать агента',
++  'help.compose.newline-ctrl-j': 'Новая строка',
++  'help.compose.newline-opt-enter': 'Новая строка',
++  'help.compose.shell-command': 'Команда в оболочке',
++  'help.chat.help': 'Справка (пустой ввод)',
++  'help.chat.history': 'История (пустой ввод)',
++  'help.chat.prompts': 'Подсказки (пустой ввод)',
++  'help.chat.new-chat': 'Новый чат',
++  'help.chat.model-reasoning': 'Модель / рассуждения',
++  'help.chat.edit-queued': 'Правка отложенных сообщений',
++  'help.conversation.close-help': 'Закрыть справку / остановить',
++  'help.conversation.clear-stop-quit': 'Очистить / остановить / выйти',
++  'help.conversation.toggle-agents': 'Развернуть / свернуть агентов',
++  'help.conversation.copy-chat': 'Скопировать чат',
++  'help.conversation.export-chat': 'Экспорт чата',
++  'help.conversation.select-copy': 'Выделить и скопировать текст',
++  'help.footer.credits': '/subscribe · /usage · 1 кредит = 1 цент',
++
++  // --- status bar (cli/src/components/status-bar.tsx) --------------------
++  'status.exit-warning': 'Нажмите Ctrl-C ещё раз, чтобы выйти',
++  'status.reconnected': 'Переподключено',
++  'status.retrying': 'повторяем…',
++  'status.capacity-wait': 'много запросов — вы в очереди, скоро начнём…',
++  'status.cannot-reach-servers':
++    'Не удаётся связаться с серверами {brand}. Повторяем… Попробуйте другую сеть.',
++  'status.thinking': 'думаем…',
++  'status.working': 'работаем…',
++  'status.unlimited': 'без ограничений',
++
++  // --- transient toasts (clipboard/status messages) -----------------------
++  'feedback.sent': 'Отзыв отправлен!',
++  'feedback.failed': 'Не удалось отправить отзыв',
++
++  // --- composer: input-mode labels and placeholders ----------------------
++  // (cli/src/utils/input-modes.ts; mode keys are lowercased there)
++  'input.mode.default.placeholder': 'введите задачу по коду или / для команд',
++  'input.mode.homedir.placeholder': 'введите задачу по коду или / для команд',
++  'input.mode.usage.placeholder': 'введите задачу по коду или / для команд',
++  'input.mode.help.placeholder': 'введите задачу по коду или / для команд',
++  'input.mode.bash.placeholder': 'введите команду bash…',
++  'input.mode.interview.label': 'Собеседование',
++  'input.mode.interview.placeholder':
++    'опишите фичу, баг или другой запрос, который нужно раскрыть…',
++  'input.mode.skill.label': 'Навык',
++  'input.mode.skill.placeholder':
++    'добавьте инструкции к навыку или нажмите Enter, чтобы запустить как есть…',
++  'input.mode.plan.label': 'План',
++  'input.mode.plan.placeholder': 'опишите, что нужно запланировать…',
++  'input.mode.review.label': 'Проверка',
++  'input.mode.review.placeholder': 'опишите, что нужно проверить…',
++  'input.mode.image.placeholder':
++    'введите путь к изображению или Ctrl+V для вставки',
++
++  // --- login screen (cli/src/components/login-modal.tsx) -----------------
++  'login.loading': 'Загрузка…',
++  'login.press-enter': 'Нажмите ENTER, чтобы войти…',
++  'login.waiting': 'Ожидание входа…',
++  'login.copy.unverified':
++    'Копирование отправлено в терминал — вставьте, чтобы проверить.',
++  'login.copy.success': '✓ Ссылка скопирована в буфер обмена!',
++  'login.copy-button.idle': '[ Копировать (c) ]',
++  'login.copy-button.copied': '[ ✓ Скопировано! ]',
++  'login.url.narrow': 'Откройте эту ссылку, чтобы войти:',
++  'login.url.wide': 'Откройте эту ссылку в браузере, чтобы войти:',
++  'login.url-wrapped':
++    '⚠ Ссылка переносится на несколько строк — по клику она обрежется. Нажмите c, чтобы скопировать её целиком.',
++  'login.error.prefix': 'Ошибка: ',
++  'login.error.timeout': 'Время ожидания входа истекло. Попробуйте ещё раз.',
++  'login.error.retry': 'Попробуйте ещё раз',
++  'login.error.restart': 'Перезапустите CLI и попробуйте ещё раз',
++  'login.invalid-key.narrow':
++    '⚠ Найден API-ключ, но он недействителен. Войдите снова.',
++  'login.invalid-key.wide':
++    '⚠ Найден API-ключ, но он недействителен. Войдите снова, чтобы продолжить.',
++  'login.tip.prefix': 'Подсказка: не удаётся скопировать? Выйдите и выполните',
++  'login.tip.suffix': 'вместо этого.',
++
++  // --- transient toasts and command feedback ------------------------------
++  'toast.send-prompt-failed': 'Не удалось отправить запрос',
++  'toast.send-followup-failed': 'Не удалось отправить продолжение',
++  'toast.send-review-failed': 'Не удалось отправить запрос на проверку',
++  'toast.paste-image-failed': 'Не удалось вставить изображение',
++  'toast.add-image-failed': 'Не удалось добавить изображение',
++  'toast.update-preference-failed': 'Не удалось обновить настройку',
++  'toast.nothing-to-copy': 'Нечего копировать — беседа пуста.',
++  'toast.login-required-usage': 'Сначала войдите, чтобы посмотреть расход.',
++  'toast.processing-attachments': 'обработка вложений…',
++
++  // --- pluralized strings (cli/src/i18n/__tests__/i18n.test.ts fixture) ---
++  // `ru.demo` is exercised by the core test; it is the reference for how the
++  // four Russian categories are written.
++  'ru.demo.one': '{count} файл',
++  'ru.demo.few': '{count} файла',
++  'ru.demo.many': '{count} файлов',
++  'ru.demo.other': '{count} файла',
++
++  // --- message queue (queue-panel.tsx, use-queue-ui.ts) ------------------
++  'queue.title.one': '{count} сообщение',
++  'queue.title.few': '{count} сообщения',
++  'queue.title.many': '{count} сообщений',
++  'queue.title.other': '{count} сообщения',
++  'queue.paused-preview.one':
++    '⏸ {count} сообщение отложено — ваше следующее сообщение уйдёт первым',
++  'queue.paused-preview.few':
++    '⏸ {count} сообщения отложено — ваше следующее сообщение уйдёт первым',
++  'queue.paused-preview.many':
++    '⏸ {count} сообщений отложено — ваше следующее сообщение уйдёт первым',
++  'queue.paused-preview.other':
++    '⏸ {count} сообщения отложено — ваше следующее сообщение уйдёт первым',
++
++  // --- sponsored proposal summary (blocks/sponsored-proposal-block.tsx) --
++  'proposal.changed-files.one': 'Изменён {count} файл. Ничего не закоммичено.',
++  'proposal.changed-files.few':
++    'Изменено {count} файла. Ничего не закоммичено.',
++  'proposal.changed-files.many':
++    'Изменено {count} файлов. Ничего не закоммичено.',
++  'proposal.changed-files.other':
++    'Изменено {count} файла. Ничего не закоммичено.',
++
++  // --- /copy success toast (commands/copy-conversation.ts) ---------------
++  'copy.message-count.one': '{count} сообщение',
++  'copy.message-count.few': '{count} сообщения',
++  'copy.message-count.many': '{count} сообщений',
++  'copy.message-count.other': '{count} сообщения',
++  'copy.tool-calls-trimmed.one': 'обрезан {count} крупный вызов инструмента',
++  'copy.tool-calls-trimmed.few': 'обрезано {count} крупных вызова инструмента',
++  'copy.tool-calls-trimmed.many':
++    'обрезано {count} крупных вызовов инструментов',
++  'copy.tool-calls-trimmed.other':
++    'обрезано {count} крупного вызова инструмента',
++  'copy.older-truncated': 'старые сообщения усечены',
++  'copy.success': 'Скопирована беседа · {count}',
++  'copy.success-trimmed':
++    'Скопирована беседа · {count} ({notes} — чтобы влезть в буфер обмена)',
++}
+diff --git a/cli/src/i18n/types.ts b/cli/src/i18n/types.ts
+new file mode 100644
+index 00000000..6d6e2cbc
+--- /dev/null
++++ b/cli/src/i18n/types.ts
+@@ -0,0 +1,29 @@
++/**
++ * Locale vocabulary shared by the i18n runtime and the settings store.
++ *
++ * This module is intentionally dependency-free (types and constants only) so
++ * `utils/settings.ts` can import the `Locale` type without pulling the i18n
++ * runtime — and its settings dependency — into a cycle.
++ */
++
++/** Locales the CLI ships a catalog for. `en` is the source language: every
++ *  message is written in English at the call site and only `ru` is stored as
++ *  a catalog, so an untranslated key falls back to English by construction. */
++export type Locale = 'en' | 'ru'
++
++export const SUPPORTED_LOCALES: readonly Locale[] = ['en', 'ru']
++
++export const DEFAULT_LOCALE: Locale = 'en'
++
++/** Language names are shown in their own language — the convention every
++ *  language picker uses, and the only way "Русский" reads correctly to the
++ *  person choosing it. */
++export const LOCALE_LABELS: Record<Locale, string> = {
++  en: 'English',
++  ru: 'Русский',
++}
++
++/** True for a value read out of settings or the environment. */
++export const isLocale = (value: unknown): value is Locale =>
++  typeof value === 'string' &&
++  (SUPPORTED_LOCALES as readonly string[]).includes(value)
+diff --git a/cli/src/index.tsx b/cli/src/index.tsx
+index 3ab96864..c1653725 100644
+--- a/cli/src/index.tsx
++++ b/cli/src/index.tsx
+@@ -33,6 +33,7 @@ import { loadPackageVersion, parseArgs } from './cli-args'
+ import { handlePublish } from './commands/publish'
+ import { runPlainLogin } from './login/plain-login'
+ import { initializeApp } from './init/init-app'
++import { initLocale } from './i18n'
+ import { getProjectRoot, setProjectRoot } from './project-files'
+ import { trackEvent } from './utils/analytics'
+ import { captureCliFunnel } from './utils/cli-product-funnel'
+@@ -269,6 +270,10 @@ async function main(): Promise<void> {
+ 
+   await initializeApp({ cwd })
+ 
++  // Resolve the UI language before anything renders: saved `/language` choice
++  // wins, otherwise auto-detect from the environment (falls back to English).
++  initLocale()
++
+   // Set the auth token for the API client
+   setApiClientAuthToken(getAuthToken())
+ 
+diff --git a/cli/src/utils/settings.ts b/cli/src/utils/settings.ts
+index f969da15..38cf4180 100644
+--- a/cli/src/utils/settings.ts
++++ b/cli/src/utils/settings.ts
+@@ -18,6 +18,7 @@ import {
+   type SavedModelStore,
+ } from '@codebuff/common/util/freebuff-default-model-migration'
+ 
++import { isLocale, type Locale } from '../i18n/types'
+ import { getConfigDir } from './auth'
+ import { AGENT_MODES } from './constants'
+ import { logger } from './logger'
+@@ -45,6 +46,11 @@ const DEFAULT_SETTINGS: Settings = {
+ export interface Settings {
+   mode?: AgentMode
+   adsEnabled?: boolean
++  /** UI language chosen with `/language`. Absent means "auto-detect from the
++   *  environment on next launch" — see `i18n/detect.ts`. The allowlist below
++   *  drops anything else, so a hand-edited value can never select a locale
++   *  this build has no catalog for. */
++  language?: Locale
+   /** Last model the user picked in the freebuff model selector. Restored on
+    *  next freebuff launch so users land in the queue for their preferred
+    *  model without re-picking. Persisted as the canonical model id. */
+@@ -171,6 +177,11 @@ const validateSettings = (parsed: unknown): Settings => {
+     settings.adsEnabled = obj.adsEnabled
+   }
+ 
++  // Validate language against the locales this build ships
++  if (isLocale(obj.language)) {
++    settings.language = obj.language
++  }
++
+   // Validate freebuffModel against the current picker catalog. Server support
+   // may intentionally outlive client visibility during a staged model
+   // retirement, but an updated client must not restore a retired selection.
+@@ -330,6 +341,18 @@ export const saveSettings = (newSettings: Partial<Settings>): void => {
+   }
+ }
+ 
++/**
++ * The saved UI language, if the user has picked one with `/language`.
++ * `undefined` means "never chosen" — auto-detection applies on next launch.
++ */
++export const loadLanguagePreference = (): Locale | undefined =>
++  loadSettings().language
++
++/** Persist the UI language so it survives restarts and beats auto-detection. */
++export const saveLanguagePreference = (language: Locale): void => {
++  saveSettings({ language })
++}
++
+ /**
+  * Load the saved agent mode preference
+  * @returns The saved mode, or 'DEFAULT' if not found or invalid
+-- 
+2.43.0
+
+
+From 76aefebc4937b4bfd09790f292a6363c9d53ed8c Mon Sep 17 00:00:00 2001
+From: Freebuff <cloud@freebuff.local>
+Date: Mon, 26 Oct 2026 03:01:15 +0000
+Subject: [PATCH 2/5] i18n: localize slash menu, help overlay, composer and
+ status bar
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Wraps the always-visible chrome of the TUI: slash-command descriptions,
+the keyboard-shortcut overlay, input-mode labels and placeholders, the
+status-line indicators and the chat tree's subscription to locale changes.
+Skill descriptions stay in English because they come from project SKILL.md
+content, not from our UI copy.
+
+🤖 Generated with Codebuff
+Co-Authored-By: Codebuff <noreply@codebuff.com>
+---
+ cli/src/chat.tsx                   | 48 ++++++++++++++----
+ cli/src/components/help-banner.tsx | 80 ++++++++++++++++++++----------
+ cli/src/components/status-bar.tsx  | 46 +++++++++++++----
+ cli/src/data/slash-commands.ts     | 28 ++++++++++-
+ cli/src/utils/input-modes.ts       | 18 ++++++-
+ 5 files changed, 169 insertions(+), 51 deletions(-)
+
+diff --git a/cli/src/chat.tsx b/cli/src/chat.tsx
+index 9d3fa287..b0ccc3eb 100644
+--- a/cli/src/chat.tsx
++++ b/cli/src/chat.tsx
+@@ -68,6 +68,7 @@ import { TodoPanel } from './components/todo-panel'
+ import { TopBanner } from './components/top-banner'
+ import { useChatRuntime } from './contexts/chat-runtime-context'
+ import { getSlashCommandsWithSkills } from './data/slash-commands'
++import { t, useLocale } from './i18n'
+ import { cliDisplayAdEnabled } from './ads/display-ads'
+ import { useAskUserBridge } from './hooks/use-ask-user-bridge'
+ import { useChatInput } from './hooks/use-chat-input'
+@@ -841,6 +842,10 @@ export const Chat = ({
+   // Get loaded skills for slash commands
+   const loadedSkills = useMemo(() => getLoadedSkills(), [])
+ 
++  // Subscribes this tree to `/language` switches so the menus below recompute
++  // their localized copy (see getSlashCommandsWithSkills).
++  const locale = useLocale()
++
+   // Filter slash commands based on current ads state - only show the option that changes state
+   // Hide both ads commands entirely for subscribers
+   // Also merge in skill commands
+@@ -854,7 +859,7 @@ export const Chat = ({
+       if (cmd.id === 'deals') return cliDisplayAdEnabled('cliStatusline')
+       return true
+     })
+-  }, [inputValue, loadedSkills, hasSubscription]) // Re-evaluate when input changes (user may have just toggled)
++  }, [inputValue, loadedSkills, hasSubscription, locale]) // Re-evaluate when input changes (user may have just toggled) or the locale changes
+ 
+   const {
+     slashContext,
+@@ -1124,7 +1129,12 @@ export const Chat = ({
+       })
+       onSubmitPrompt(prompt, agentMode).catch((error) => {
+         logger.error({ error }, '[suggested-prompt] Failed to submit prompt')
+-        showClipboardMessage('Failed to send prompt', { durationMs: 3000 })
++        showClipboardMessage(
++          t('toast.send-prompt-failed', 'Failed to send prompt'),
++          {
++            durationMs: 3000,
++          },
++        )
+       })
+     },
+   )
+@@ -1169,7 +1179,10 @@ export const Chat = ({
+             { error },
+             '[followup-click] onSubmitPrompt failed with error',
+           )
+-          showClipboardMessage('Failed to send followup', { durationMs: 3000 })
++          showClipboardMessage(
++            t('toast.send-followup-failed', 'Failed to send followup'),
++            { durationMs: 3000 },
++          )
+         })
+     }
+ 
+@@ -1526,9 +1539,12 @@ export const Chat = ({
+         .then((result) => handleCommandResult(result))
+         .catch((error) => {
+           logger.error({ error }, '[review] Failed to submit review prompt')
+-          showClipboardMessage('Failed to send review request', {
+-            durationMs: 3000,
+-          })
++          showClipboardMessage(
++            t('toast.send-review-failed', 'Failed to send review request'),
++            {
++              durationMs: 3000,
++            },
++          )
+         })
+     },
+     [
+@@ -1843,9 +1859,13 @@ export const Chat = ({
+           const result = readClipboardImage()
+           if (!result.success || !result.imagePath) {
+             useChatStore.getState().removePendingImage(placeholderPath)
+-            showClipboardMessage(result.error || 'Failed to paste image', {
+-              durationMs: 3000,
+-            })
++            showClipboardMessage(
++              result.error ||
++                t('toast.paste-image-failed', 'Failed to paste image'),
++              {
++                durationMs: 3000,
++              },
++            )
+             return
+           }
+ 
+@@ -1853,7 +1873,10 @@ export const Chat = ({
+           addPendingImageFromFile(result.imagePath, cwd, placeholderPath).catch(
+             (error) => {
+               logger.error({ error }, 'Failed to add pending image from file')
+-              showClipboardMessage('Failed to add image', { durationMs: 3000 })
++              showClipboardMessage(
++                t('toast.add-image-failed', 'Failed to add image'),
++                { durationMs: 3000 },
++              )
+             },
+           )
+         }, 0)
+@@ -1862,7 +1885,10 @@ export const Chat = ({
+         const cwd = getProjectRoot() ?? process.cwd()
+         validateAndAddImage(imagePath, cwd).catch((error) => {
+           logger.error({ error, imagePath }, 'Failed to validate and add image')
+-          showClipboardMessage('Failed to add image', { durationMs: 3000 })
++          showClipboardMessage(
++            t('toast.add-image-failed', 'Failed to add image'),
++            { durationMs: 3000 },
++          )
+         })
+       },
+       onPasteFilePath: (filePath: string, isDirectory: boolean) => {
+diff --git a/cli/src/components/help-banner.tsx b/cli/src/components/help-banner.tsx
+index d42fe856..552e3b75 100644
+--- a/cli/src/components/help-banner.tsx
++++ b/cli/src/components/help-banner.tsx
+@@ -1,48 +1,71 @@
+ import React from 'react'
+ import { TextAttributes } from '@opentui/core'
+ 
++import { useT } from '../i18n'
+ import { useTheme } from '../hooks/use-theme'
+ import { useTerminalDimensions } from '../hooks/use-terminal-dimensions'
+ import { IS_FREEBUFF } from '../utils/constants'
+ 
++/**
++ * Shortcut groups. English text lives here as the fallback for `t()` and is
++ * what renders when the locale is `en`; the Russian catalog overrides each
++ * `key`. Row keys are unique even where two rows share English copy (the two
++ * "New line" rows), so a translation never gets reused by the wrong shortcut.
++ */
+ const SECTIONS = [
+   {
++    key: 'compose',
+     title: 'Compose',
+     rows: [
+-      ['/', 'Commands'],
+-      ['@files', 'Mention files'],
+-      ['@agents', 'Use an agent'],
+-      ['Ctrl+J', 'New line'],
+-      ['Opt+Enter', 'New line'],
+-      ['/bash', 'Shell command'],
++      { shortcut: '/', key: 'commands', text: 'Commands' },
++      { shortcut: '@files', key: 'mention-files', text: 'Mention files' },
++      { shortcut: '@agents', key: 'use-agent', text: 'Use an agent' },
++      { shortcut: 'Ctrl+J', key: 'newline-ctrl-j', text: 'New line' },
++      { shortcut: 'Opt+Enter', key: 'newline-opt-enter', text: 'New line' },
++      { shortcut: '/bash', key: 'shell-command', text: 'Shell command' },
+     ],
+   },
+   {
++    key: 'chat',
+     title: 'Chat',
+     rows: [
+-      ['?', 'Help (empty input)'],
+-      ['←', 'History (empty input)'],
+-      ['↑ / ↓', 'Prompts (empty input)'],
+-      ['/new', 'New chat'],
+-      ['/model', 'Model / reasoning'],
+-      ['Ctrl+Q', 'Edit queued messages'],
++      { shortcut: '?', key: 'help', text: 'Help (empty input)' },
++      { shortcut: '←', key: 'history', text: 'History (empty input)' },
++      { shortcut: '↑ / ↓', key: 'prompts', text: 'Prompts (empty input)' },
++      { shortcut: '/new', key: 'new-chat', text: 'New chat' },
++      { shortcut: '/model', key: 'model-reasoning', text: 'Model / reasoning' },
++      {
++        shortcut: 'Ctrl+Q',
++        key: 'edit-queued',
++        text: 'Edit queued messages',
++      },
+     ],
+   },
+   {
++    key: 'conversation',
+     title: 'Conversation',
+     rows: [
+-      ['Esc', 'Close help / stop'],
+-      ['Ctrl+C', 'Clear / stop / quit'],
+-      ['Ctrl+T', 'Expand / collapse agents'],
+-      ['/copy', 'Copy chat'],
+-      ['/export', 'Export chat'],
+-      ['Drag', 'Select and copy text'],
++      { shortcut: 'Esc', key: 'close-help', text: 'Close help / stop' },
++      {
++        shortcut: 'Ctrl+C',
++        key: 'clear-stop-quit',
++        text: 'Clear / stop / quit',
++      },
++      {
++        shortcut: 'Ctrl+T',
++        key: 'toggle-agents',
++        text: 'Expand / collapse agents',
++      },
++      { shortcut: '/copy', key: 'copy-chat', text: 'Copy chat' },
++      { shortcut: '/export', key: 'export-chat', text: 'Export chat' },
++      { shortcut: 'Drag', key: 'select-copy', text: 'Select and copy text' },
+     ],
+   },
+ ] as const
+ 
+ /** Aligned shortcut columns; wrap whole columns on smaller terminals. */
+ export const HelpBanner = () => {
++  const t = useT()
+   const theme = useTheme()
+   const { terminalWidth, terminalHeight } = useTerminalDimensions()
+   const width = Math.max(16, terminalWidth - 4)
+@@ -66,7 +89,7 @@ export const HelpBanner = () => {
+           marginBottom: 1,
+         }}
+       >
+-        Keyboard shortcuts
++        {t('help.title', 'Keyboard shortcuts')}
+       </text>
+       <scrollbox
+         style={{
+@@ -85,7 +108,7 @@ export const HelpBanner = () => {
+         >
+           {SECTIONS.map((section) => (
+             <box
+-              key={section.title}
++              key={section.key}
+               style={{
+                 flexDirection: 'column',
+                 width: columnWidth,
+@@ -98,16 +121,16 @@ export const HelpBanner = () => {
+                   attributes: TextAttributes.BOLD,
+                 }}
+               >
+-                {section.title}
++                {t(`help.section.${section.key}`, section.title)}
+               </text>
+               {section.rows
+-                .filter(([key]) => IS_FREEBUFF || key !== '/model')
+-                .map(([key, description]) => (
+-                  <box key={key} style={{ flexDirection: 'row' }}>
++                .filter((row) => IS_FREEBUFF || row.shortcut !== '/model')
++                .map((row) => (
++                  <box key={row.key} style={{ flexDirection: 'row' }}>
+                     <text
+                       style={{ fg: theme.primary, width: 11, flexShrink: 0 }}
+                     >
+-                      {key}
++                      {row.shortcut}
+                     </text>
+                     <text
+                       style={{
+@@ -118,7 +141,7 @@ export const HelpBanner = () => {
+                         wrapMode: 'word',
+                       }}
+                     >
+-                      {description}
++                      {t(`help.${section.key}.${row.key}`, row.text)}
+                     </text>
+                   </box>
+                 ))}
+@@ -127,7 +150,10 @@ export const HelpBanner = () => {
+         </box>
+         {!IS_FREEBUFF && (
+           <text style={{ fg: theme.muted, marginTop: 1 }}>
+-            /subscribe · /usage · 1 credit = 1 cent
++            {t(
++              'help.footer.credits',
++              '/subscribe · /usage · 1 credit = 1 cent',
++            )}
+           </text>
+         )}
+       </scrollbox>
+diff --git a/cli/src/components/status-bar.tsx b/cli/src/components/status-bar.tsx
+index 4d7209f9..9327ceca 100644
+--- a/cli/src/components/status-bar.tsx
++++ b/cli/src/components/status-bar.tsx
+@@ -9,6 +9,7 @@ import { ShimmerText } from './shimmer-text'
+ 
+ import { useFreebuffSessionProgress } from '../hooks/use-freebuff-session-progress'
+ import { useTheme } from '../hooks/use-theme'
++import { useT } from '../i18n'
+ import { useChatStore } from '../state/chat-store'
+ import { useFreebuffModelDirectory } from '../state/freebuff-catalog-store'
+ import { useByokSelectionStore } from '../utils/byok'
+@@ -77,6 +78,7 @@ export const StatusBar = ({
+   freebuffSession,
+ }: StatusBarProps) => {
+   const theme = useTheme()
++  const t = useT()
+   const byok = useByokSelectionStore((state) => state.selected)
+   const [elapsedSeconds, setElapsedSeconds] = useState(0)
+ 
+@@ -156,12 +158,18 @@ export const StatusBar = ({
+   const renderStatusIndicator = () => {
+     switch (statusIndicatorState.kind) {
+       case 'ctrlC':
+-        return <span fg={theme.secondary}>Press Ctrl-C again to exit</span>
++        return (
++          <span fg={theme.secondary}>
++            {t('status.exit-warning', 'Press Ctrl-C again to exit')}
++          </span>
++        )
+ 
+       case 'clipboard':
+-        // Use green color for feedback success messages
++        // Use green color for feedback success messages. Compared against the
++        // same localized string feedback-container.tsx posts, so the check
++        // holds in every locale (not just English).
+         const isFeedbackSuccess =
+-          statusIndicatorState.message.includes('Feedback sent')
++          statusIndicatorState.message === t('feedback.sent', 'Feedback sent!')
+         return (
+           <span fg={isFeedbackSuccess ? theme.success : theme.primary}>
+             {statusIndicatorState.message}
+@@ -169,15 +177,27 @@ export const StatusBar = ({
+         )
+ 
+       case 'reconnected':
+-        return <span fg={theme.success}>Reconnected</span>
++        return (
++          <span fg={theme.success}>
++            {t('status.reconnected', 'Reconnected')}
++          </span>
++        )
+ 
+       case 'retrying':
+-        return <ShimmerText text="retrying..." primaryColor={theme.warning} />
++        return (
++          <ShimmerText
++            text={t('status.retrying', 'retrying...')}
++            primaryColor={theme.warning}
++          />
++        )
+ 
+       case 'capacityWait':
+         return (
+           <ShimmerText
+-            text="high demand — in line, starting soon..."
++            text={t(
++              'status.capacity-wait',
++              'high demand — in line, starting soon...',
++            )}
+             primaryColor={theme.warning}
+           />
+         )
+@@ -186,14 +206,20 @@ export const StatusBar = ({
+         // The connection monitor starts optimistic; this state means a check failed.
+         return (
+           <span fg={theme.warning}>
+-            {`Can't reach ${IS_FREEBUFF ? 'Freebuff' : 'Codebuff'}'s servers. Retrying… Try another network.`}
++            {t(
++              'status.cannot-reach-servers',
++              "Can't reach {brand}'s servers. Retrying… Try another network.",
++              {
++                brand: IS_FREEBUFF ? 'Freebuff' : 'Codebuff',
++              },
++            )}
+           </span>
+         )
+ 
+       case 'waiting':
+         return (
+           <ShimmerText
+-            text="thinking..."
++            text={t('status.thinking', 'thinking...')}
+             interval={SHIMMER_INTERVAL_MS}
+             primaryColor={theme.secondary}
+           />
+@@ -202,7 +228,7 @@ export const StatusBar = ({
+       case 'streaming':
+         return (
+           <ShimmerText
+-            text="working..."
++            text={t('status.working', 'working...')}
+             interval={SHIMMER_INTERVAL_MS}
+             primaryColor={theme.secondary}
+           />
+@@ -226,7 +252,7 @@ export const StatusBar = ({
+           // inside a <span> trip OpenTUI's reconciler (see knowledge.md).
+           const idleLabel = [
+             isUnlimited
+-              ? 'unlimited'
++              ? t('status.unlimited', 'unlimited')
+               : clock && formatFreebuffSessionRemaining(clock.remainingMs),
+             contextUsage,
+           ]
+diff --git a/cli/src/data/slash-commands.ts b/cli/src/data/slash-commands.ts
+index e9d234de..2c9d2ea3 100644
+--- a/cli/src/data/slash-commands.ts
++++ b/cli/src/data/slash-commands.ts
+@@ -1,3 +1,4 @@
++import { t } from '../i18n'
+ import { AGENT_MODES, IS_FREEBUFF } from '../utils/constants'
+ 
+ import type { SkillsMap } from '@codebuff/common/types/skill'
+@@ -175,7 +176,10 @@ const ALL_SLASH_COMMANDS: SlashCommand[] = [
+   {
+     id: 'feedback',
+     label: 'feedback',
+-    description: IS_FREEBUFF ? 'Share general feedback about Freebuff' : 'Share general feedback about Codebuff',
++    // `{brand}` is resolved when the menu is built (see
++    // getSlashCommandsWithSkills), so English renders exactly as before while
++    // the Russian catalog reuses the same placeholder.
++    description: 'Share general feedback about {brand}',
+   },
+   {
+     id: 'bash',
+@@ -200,6 +204,12 @@ const ALL_SLASH_COMMANDS: SlashCommand[] = [
+     label: 'theme:toggle',
+     description: 'Toggle between light and dark mode',
+   },
++  {
++    id: 'language',
++    label: 'language',
++    description: 'Show or change the interface language',
++    aliases: ['lang', 'locale'],
++  },
+   {
+     id: 'byok',
+     label: 'byok',
+@@ -274,6 +284,13 @@ function truncateDescription(description: string): string {
+ /**
+  * Returns SLASH_COMMANDS merged with skill commands.
+  * Skills become slash commands that users can invoke directly.
++ *
++ * Command descriptions are localized here rather than at module scope so a
++ * `/language` switch takes effect on the next menu open: the English text
++ * stays in the data file as the fallback, and `cmd.<id>.description` in the
++ * catalog overrides it per locale. Skill descriptions are deliberately NOT
++ * localized — they are content authored in the project's SKILL.md files, not
++ * our UI copy.
+  */
+ export function getSlashCommandsWithSkills(skills: SkillsMap): SlashCommand[] {
+   const skillCommands: SlashCommand[] = Object.values(skills).map((skill) => ({
+@@ -283,7 +300,14 @@ export function getSlashCommandsWithSkills(skills: SkillsMap): SlashCommand[] {
+     insertText: `/skill:${skill.name} `,
+   }))
+ 
+-  const commands = [...SLASH_COMMANDS, ...skillCommands]
++  const localizedCommands = SLASH_COMMANDS.map((command) => ({
++    ...command,
++    description: t(`cmd.${command.id}.description`, command.description, {
++      brand: IS_FREEBUFF ? 'Freebuff' : 'Codebuff',
++    }),
++  }))
++
++  const commands = [...localizedCommands, ...skillCommands]
+ 
+   return commands
+ }
+diff --git a/cli/src/utils/input-modes.ts b/cli/src/utils/input-modes.ts
+index 68563e3d..dc41570d 100644
+--- a/cli/src/utils/input-modes.ts
++++ b/cli/src/utils/input-modes.ts
+@@ -1,3 +1,4 @@
++import { t } from '../i18n'
+ import { IS_FREEBUFF } from './constants'
+ 
+ // Input mode types and configurations
+@@ -182,6 +183,21 @@ if (IS_FREEBUFF) {
+   }
+ }
+ 
++/**
++ * Read a mode's config with its visible copy localized.
++ *
++ * Labels and placeholders live in English in `INPUT_MODE_CONFIGS` above (the
++ * source of truth, and what renders under the default `en` locale); `t()`
++ * overrides them per locale. The mode's machine name stays English — it is a
++ * key, not copy — and callers keep reading the same fields as before.
++ */
+ export function getInputModeConfig(mode: InputMode): InputModeConfig {
+-  return INPUT_MODE_CONFIGS[mode]
++  const config = INPUT_MODE_CONFIGS[mode]
++  const key = mode.toLowerCase()
++  return {
++    ...config,
++    label:
++      config.label === null ? null : t(`input.mode.${key}.label`, config.label),
++    placeholder: t(`input.mode.${key}.placeholder`, config.placeholder),
++  }
+ }
+-- 
+2.43.0
+
+
+From 38bed59cdad50b3e85a4428002ba99d4e69e2f5b Mon Sep 17 00:00:00 2001
+From: Freebuff <cloud@freebuff.local>
+Date: Mon, 26 Oct 2026 03:01:16 +0000
+Subject: [PATCH 3/5] i18n: localize login screen, toasts and pluralized
+ strings
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Translates the first screen the user sees plus the transient messages
+(copy, send, attachment and feedback toasts), and moves the four count
+strings that had inline English pluralization onto tp(), giving Russian its
+one/few/many/other forms through Intl.PluralRules.
+
+🤖 Generated with Codebuff
+Co-Authored-By: Codebuff <noreply@codebuff.com>
+---
+ cli/src/commands/copy-conversation.ts         | 35 +++++++---
+ cli/src/commands/router.ts                    | 10 ++-
+ cli/src/commands/usage.ts                     |  8 ++-
+ .../blocks/sponsored-proposal-block.tsx       |  6 +-
+ cli/src/components/feedback-container.tsx     | 14 +++-
+ cli/src/components/login-modal.tsx            | 68 +++++++++++++------
+ cli/src/components/queue-panel.tsx            |  7 +-
+ cli/src/hooks/use-queue-ui.ts                 |  8 ++-
+ cli/src/hooks/use-update-preference.ts        | 10 ++-
+ 9 files changed, 124 insertions(+), 42 deletions(-)
+
+diff --git a/cli/src/commands/copy-conversation.ts b/cli/src/commands/copy-conversation.ts
+index 8c130efe..9839e0aa 100644
+--- a/cli/src/commands/copy-conversation.ts
++++ b/cli/src/commands/copy-conversation.ts
+@@ -12,6 +12,7 @@
+  * as an OSC 52 fallback when no native clipboard tool is available.
+  */
+ 
++import { t, tp } from '../i18n'
+ import { copyTextToClipboard, showClipboardMessage } from '../utils/clipboard'
+ import { useChatStore } from '../state/chat-store'
+ import { IS_FREEBUFF } from '../utils/constants'
+@@ -264,17 +265,29 @@ function copySuccessMessage(
+   messageCount: number,
+   { omittedCount, truncated }: SerializedConversation,
+ ): string {
+-  const count = `${messageCount} message${messageCount === 1 ? '' : 's'}`
++  const count = tp('copy.message-count', messageCount, {
++    one: '{count} message',
++    other: '{count} messages',
++  })
+   const trimNotes: string[] = []
+   if (omittedCount > 0) {
+     trimNotes.push(
+-      `${omittedCount} large tool call${omittedCount === 1 ? '' : 's'} trimmed`,
++      tp('copy.tool-calls-trimmed', omittedCount, {
++        one: '{count} large tool call trimmed',
++        other: '{count} large tool calls trimmed',
++      }),
+     )
+   }
+-  if (truncated) trimNotes.push('older messages truncated')
++  if (truncated) {
++    trimNotes.push(t('copy.older-truncated', 'older messages truncated'))
++  }
+   return trimNotes.length > 0
+-    ? `Copied conversation · ${count} (${trimNotes.join(', ')} to fit clipboard)`
+-    : `Copied conversation · ${count}`
++    ? t(
++        'copy.success-trimmed',
++        'Copied conversation · {count} ({notes} to fit clipboard)',
++        { count, notes: trimNotes.join(', ') },
++      )
++    : t('copy.success', 'Copied conversation · {count}', { count })
+ }
+ 
+ function conversationClipboardContent(
+@@ -368,9 +381,15 @@ export async function handleCopyConversationCommand(
+   params.setInputValue({ text: '', cursorPosition: 0, lastEditDueToNav: false })
+ 
+   if (messages.length === 0) {
+-    showClipboardMessage('Nothing to copy — the conversation is empty.', {
+-      durationMs: 3000,
+-    })
++    showClipboardMessage(
++      t(
++        'toast.nothing-to-copy',
++        'Nothing to copy — the conversation is empty.',
++      ),
++      {
++        durationMs: 3000,
++      },
++    )
+     return
+   }
+ 
+diff --git a/cli/src/commands/router.ts b/cli/src/commands/router.ts
+index f1051adf..0a402de4 100644
+--- a/cli/src/commands/router.ts
++++ b/cli/src/commands/router.ts
+@@ -1,6 +1,7 @@
+ import { freebuffChatNeedsAdmission } from '../state/freebuff-chat-store'
+ import { AnalyticsEvent } from '@codebuff/common/constants/analytics-events'
+ import { runTerminalCommand } from '@codebuff/sdk'
++import { t } from '../i18n'
+ 
+ 
+ import {
+@@ -481,9 +482,12 @@ export async function routeUserPrompt(
+ 
+   // Block sending if attachments are still processing
+   if (hasProcessingImages() || hasProcessingFiles()) {
+-    showClipboardMessage('processing attachments...', {
+-      durationMs: 2000,
+-    })
++    showClipboardMessage(
++      t('toast.processing-attachments', 'processing attachments...'),
++      {
++        durationMs: 2000,
++      },
++    )
+     return
+   }
+ 
+diff --git a/cli/src/commands/usage.ts b/cli/src/commands/usage.ts
+index 35bec7ca..de66c473 100644
+--- a/cli/src/commands/usage.ts
++++ b/cli/src/commands/usage.ts
+@@ -1,3 +1,4 @@
++import { t } from '../i18n'
+ import { useChatStore } from '../state/chat-store'
+ import { getAuthToken } from '../utils/auth'
+ import { getSystemMessage } from '../utils/message-history'
+@@ -12,7 +13,12 @@ export async function handleUsageCommand(): Promise<{
+   if (!authToken) {
+     const postUserMessage: PostUserMessageFn = (prev) => [
+       ...prev,
+-      getSystemMessage('Please log in first to view your usage.'),
++      getSystemMessage(
++        t(
++          'toast.login-required-usage',
++          'Please log in first to view your usage.',
++        ),
++      ),
+     ]
+     return { postUserMessage }
+   }
+diff --git a/cli/src/components/blocks/sponsored-proposal-block.tsx b/cli/src/components/blocks/sponsored-proposal-block.tsx
+index 9b6d9a90..659a7489 100644
+--- a/cli/src/components/blocks/sponsored-proposal-block.tsx
++++ b/cli/src/components/blocks/sponsored-proposal-block.tsx
+@@ -21,6 +21,7 @@ import React, { useCallback, useContext, useEffect, useState } from 'react'
+ 
+ import { Button } from '../button'
+ import { AdReportButton, AdReportRegistryContext } from '../ad-report-button'
++import { tp } from '../../i18n'
+ import { useMessageBlockStore } from '../../state/message-block-store'
+ import { getAuthToken } from '../../utils/auth'
+ import { safeOpen } from '../../utils/open-url'
+@@ -558,7 +559,10 @@ export const SponsoredProposalBlock: React.FC<{
+       {undoable && (
+         <box style={{ width: '100%', flexDirection: 'column' }}>
+           <text style={{ fg: theme.muted }}>
+-            {`Changed ${changedCount === 1 ? '1 file' : `${changedCount} files`}. Nothing was committed.`}
++            {tp('proposal.changed-files', changedCount, {
++              one: 'Changed {count} file. Nothing was committed.',
++              other: 'Changed {count} files. Nothing was committed.',
++            })}
+           </text>
+           {sponsoredChangedFilesLines(
+             run!.changedFiles.map((file) => sanitizeTerminalText(file)),
+diff --git a/cli/src/components/feedback-container.tsx b/cli/src/components/feedback-container.tsx
+index 29fd4761..07c7220f 100644
+--- a/cli/src/components/feedback-container.tsx
++++ b/cli/src/components/feedback-container.tsx
+@@ -2,6 +2,7 @@ import React, { useCallback, useEffect } from 'react'
+ import { useShallow } from 'zustand/react/shallow'
+ 
+ import { FeedbackInputMode } from './feedback-input-mode'
++import { t } from '../i18n'
+ import { useChatStore } from '../state/chat-store'
+ import { useFeedbackStore } from '../state/feedback-store'
+ import { showClipboardMessage } from '../utils/clipboard'
+@@ -104,7 +105,10 @@ export const FeedbackContainer: React.FC<FeedbackContainerProps> = ({
+           )
+           if (!shouldSettleSubmission) return
+           store.setIsSubmitting(false)
+-          showClipboardMessage('Feedback failed to send', { durationMs: 5000 })
++          showClipboardMessage(
++            t('feedback.failed', 'Feedback failed to send'),
++            { durationMs: 5000 },
++          )
+           return
+         }
+ 
+@@ -122,7 +126,9 @@ export const FeedbackContainer: React.FC<FeedbackContainerProps> = ({
+         }
+ 
+         if (shouldSettleSubmission) {
+-          showClipboardMessage('Feedback sent!', { durationMs: 5000 })
++          showClipboardMessage(t('feedback.sent', 'Feedback sent!'), {
++            durationMs: 5000,
++          })
+         }
+       })
+       .catch((error: unknown) => {
+@@ -132,7 +138,9 @@ export const FeedbackContainer: React.FC<FeedbackContainerProps> = ({
+           return
+         }
+         store.setIsSubmitting(false)
+-        showClipboardMessage('Feedback failed to send', { durationMs: 5000 })
++        showClipboardMessage(t('feedback.failed', 'Feedback failed to send'), {
++          durationMs: 5000,
++        })
+       })
+   }, [
+     feedbackText,
+diff --git a/cli/src/components/login-modal.tsx b/cli/src/components/login-modal.tsx
+index a6f7205e..b4fb7e36 100644
+--- a/cli/src/components/login-modal.tsx
++++ b/cli/src/components/login-modal.tsx
+@@ -16,6 +16,7 @@ import { useLoginPolling } from '../hooks/use-login-polling'
+ import { useLogo } from '../hooks/use-logo'
+ import { useSheenAnimation } from '../hooks/use-sheen-animation'
+ import { useTheme } from '../hooks/use-theme'
++import { useT } from '../i18n'
+ import { formatUrl, calculateResponsiveLayout } from '../login/utils'
+ import { useLoginStore } from '../state/login-store'
+ import { captureCliFunnel } from '../utils/cli-product-funnel'
+@@ -39,6 +40,7 @@ export const LoginModal = ({
+   const renderer = useRenderer()
+   useEffect(() => captureCliFunnel('login', 'shown'), [])
+   const theme = useTheme()
++  const t = useT()
+ 
+   // Use zustand store for all state
+   const {
+@@ -97,8 +99,11 @@ export const LoginModal = ({
+         setJustCopied(result !== 'unverified')
+         setCopyMessage(
+           result === 'unverified'
+-            ? 'Copy sent to terminal — paste to check.'
+-            : '✓ URL copied to clipboard!',
++            ? t(
++                'login.copy.unverified',
++                'Copy sent to terminal — paste to check.',
++              )
++            : t('login.copy.success', '✓ URL copied to clipboard!'),
+         )
+         setTimeout(
+           () => {
+@@ -173,9 +178,9 @@ export const LoginModal = ({
+ 
+   // Handle polling timeout
+   const handleTimeout = useCallback(() => {
+-    setError('Login timed out. Please try again.')
++    setError(t('login.error.timeout', 'Login timed out. Please try again.'))
+     setIsWaitingForEnter(false)
+-  }, [setError, setIsWaitingForEnter])
++  }, [setError, setIsWaitingForEnter, t])
+ 
+   // Handle polling error
+   const handlePollingError = useCallback(
+@@ -279,8 +284,14 @@ export const LoginModal = ({
+           <text style={{ wrapMode: 'word' }}>
+             <span fg={theme.secondary}>
+               {isNarrow
+-                ? "⚠ Found API key but it's invalid. Please log in again."
+-                : '⚠ We found an API key but it appears to be invalid. Please log in again to continue.'}
++                ? t(
++                    'login.invalid-key.narrow',
++                    "⚠ Found API key but it's invalid. Please log in again.",
++                  )
++                : t(
++                    'login.invalid-key.wide',
++                    '⚠ We found an API key but it appears to be invalid. Please log in again to continue.',
++                  )}
+             </span>
+           </text>
+         </box>
+@@ -321,7 +332,9 @@ export const LoginModal = ({
+             }}
+           >
+             <text style={{ wrapMode: 'none' }}>
+-              <span fg={theme.secondary}>Loading...</span>
++              <span fg={theme.secondary}>
++                {t('login.loading', 'Loading...')}
++              </span>
+             </text>
+           </box>
+         )}
+@@ -338,14 +351,20 @@ export const LoginModal = ({
+             }}
+           >
+             <text style={{ wrapMode: 'word' }}>
+-              <span fg="red">Error: {error}</span>
++              <span fg="red">
++                {t('login.error.prefix', 'Error: ')}
++                {error}
++              </span>
+             </text>
+             {!isVerySmall && (
+               <text style={{ wrapMode: 'word' }}>
+                 <span fg={theme.secondary}>
+                   {isNarrow
+-                    ? 'Please try again'
+-                    : 'Please restart the CLI and try again'}
++                    ? t('login.error.retry', 'Please try again')
++                    : t(
++                        'login.error.restart',
++                        'Please restart the CLI and try again',
++                      )}
+                 </span>
+               </text>
+             )}
+@@ -365,7 +384,7 @@ export const LoginModal = ({
+           >
+             <text style={{ wrapMode: 'word' }}>
+               <span fg={'#00cc00'}>
+-                Press ENTER to login...
++                {t('login.press-enter', 'Press ENTER to login...')}
+               </span>
+             </text>
+           </box>
+@@ -386,8 +405,11 @@ export const LoginModal = ({
+             <text style={{ wrapMode: 'word' }}>
+               <span fg={theme.foreground}>
+                 {isNarrow
+-                  ? 'Open this URL to login:'
+-                  : 'Open this URL in your browser to login:'}
++                  ? t('login.url.narrow', 'Open this URL to login:')
++                  : t(
++                      'login.url.wide',
++                      'Open this URL in your browser to login:',
++                    )}
+               </span>
+             </text>
+             <box
+@@ -417,8 +439,10 @@ export const LoginModal = ({
+             {loginUrlWrapped && (
+               <text style={{ wrapMode: 'word' }}>
+                 <span fg={theme.warning}>
+-                  ⚠ The link wraps across lines — clicking it will cut it off.
+-                  Press c to copy the full link instead.
++                  {t(
++                    'login.url-wrapped',
++                    '⚠ The link wraps across lines — clicking it will cut it off. Press c to copy the full link instead.',
++                  )}
+                 </span>
+               </text>
+             )}
+@@ -445,7 +469,9 @@ export const LoginModal = ({
+                           : theme.primary
+                     }
+                   >
+-                    {justCopied ? '[ ✓ Copied! ]' : '[ Copy link (c) ]'}
++                    {justCopied
++                      ? t('login.copy-button.copied', '[ ✓ Copied! ]')
++                      : t('login.copy-button.idle', '[ Copy link (c) ]')}
+                   </span>
+                 </text>
+               </Button>
+@@ -461,17 +487,21 @@ export const LoginModal = ({
+             >
+               <text style={{ wrapMode: 'none' }}>
+                 <span fg={theme.secondary}>
+-                  Waiting for login...
++                  {t('login.waiting', 'Waiting for login...')}
+                 </span>
+               </text>
+               {isRemoteSession() && !isVerySmall && (
+                 <text style={{ wrapMode: 'word' }}>
+                   <span fg={theme.secondary}>
+-                    Tip: Can't copy? Exit and run{' '}
++                    {t(
++                      'login.tip.prefix',
++                      "Tip: Can't copy? Exit and run",
++                    )}{' '}
+                   </span>
+                   <span fg={theme.primary}>{IS_FREEBUFF ? 'freebuff' : 'codebuff'} login</span>
+                   <span fg={theme.secondary}>
+-                    {' '}instead.
++                    {' '}
++                    {t('login.tip.suffix', 'instead.')}
+                   </span>
+                 </text>
+               )}
+diff --git a/cli/src/components/queue-panel.tsx b/cli/src/components/queue-panel.tsx
+index 102b73af..3b3bed12 100644
+--- a/cli/src/components/queue-panel.tsx
++++ b/cli/src/components/queue-panel.tsx
+@@ -1,4 +1,3 @@
+-import { pluralize } from '@codebuff/common/util/string'
+ import { useKeyboard } from '@opentui/react'
+ import React, { useCallback, useEffect, useMemo, useState } from 'react'
+ 
+@@ -6,6 +5,7 @@ import { Button } from './button'
+ import { ClickableTitleBox } from './clickable-title-box'
+ import { MultilineInput } from './multiline-input'
+ import { useTheme } from '../hooks/use-theme'
++import { tp } from '../i18n'
+ import { truncateToSingleLinePreview } from '../utils/agent-display'
+ import { clamp } from '../utils/math'
+ import { resolveQueuePanelAction } from '../utils/queue-panel-actions'
+@@ -210,7 +210,10 @@ export const QueuePanel: React.FC<QueuePanelProps> = ({
+ 
+   return (
+     <ClickableTitleBox
+-      title={` ▾ Queue — ${pluralize(queuedMessages.length, 'message')} `}
++      title={` ▾ ${tp('queue.title', queuedMessages.length, {
++        one: 'Queue — {count} message',
++        other: 'Queue — {count} messages',
++      })} `}
+       titleAlignment="center"
+       onTitleClick={editing ? undefined : onClose}
+       style={{
+diff --git a/cli/src/hooks/use-queue-ui.ts b/cli/src/hooks/use-queue-ui.ts
+index 7041d125..4f5c1c4c 100644
+--- a/cli/src/hooks/use-queue-ui.ts
++++ b/cli/src/hooks/use-queue-ui.ts
+@@ -1,7 +1,6 @@
+-import { pluralize } from '@codebuff/common/util/string'
+ import { useMemo } from 'react'
+ 
+-
++import { tp } from '../i18n'
+ import { formatQueuedPreview } from '../utils/helpers'
+ 
+ import type { QueuedMessage } from './use-message-queue'
+@@ -40,7 +39,10 @@ export const useQueueUi = ({
+         Math.max(30, separatorWidth - 20),
+       )
+     } else if (queuePaused && queuedCount > 0) {
+-      preview = `⏸ ${pluralize(queuedCount, 'message')} queued — your next message sends first`
++      preview = tp('queue.paused-preview', queuedCount, {
++        one: '⏸ {count} message queued — your next message sends first',
++        other: '⏸ {count} messages queued — your next message sends first',
++      })
+     }
+ 
+     if (!preview) return undefined
+diff --git a/cli/src/hooks/use-update-preference.ts b/cli/src/hooks/use-update-preference.ts
+index 6fdafcb4..5130f9a4 100644
+--- a/cli/src/hooks/use-update-preference.ts
++++ b/cli/src/hooks/use-update-preference.ts
+@@ -6,6 +6,7 @@ import {
+   setActivityQueryData,
+ } from './use-activity-query'
+ import { subscriptionQueryKeys } from './use-subscription-query'
++import { t } from '../i18n'
+ import { showClipboardMessage } from '../utils/clipboard'
+ import { getApiClient } from '../utils/codebuff-api'
+ import { logger } from '../utils/logger'
+@@ -43,7 +44,9 @@ export function useUpdatePreference() {
+       )
+ 
+       if (!response.ok) {
+-        const errorMessage = response.error || 'Failed to update preference'
++        const errorMessage =
++          response.error ||
++          t('toast.update-preference-failed', 'Failed to update preference')
+         throw new Error(errorMessage)
+       }
+ 
+@@ -55,7 +58,10 @@ export function useUpdatePreference() {
+         setActivityQueryData(queryKey, previousData)
+       }
+       logger.error({ err }, 'Failed to update preference')
+-      showClipboardMessage('Failed to update preference', { durationMs: 3000 })
++      showClipboardMessage(
++        t('toast.update-preference-failed', 'Failed to update preference'),
++        { durationMs: 3000 },
++      )
+     } finally {
+       setIsPending(false)
+     }
+-- 
+2.43.0
+
+
+From fdcbbf4dd467b882d452b8965e691f133f9203a0 Mon Sep 17 00:00:00 2001
+From: Freebuff <cloud@freebuff.local>
+Date: Mon, 26 Oct 2026 03:01:16 +0000
+Subject: [PATCH 4/5] i18n: test the locale runtime and the ru catalog
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Covers interpolation (including ${...} and %s left alone), Russian plural
+categories, locale detection precedence and persistence, and gates the
+catalog itself: duplicate keys, key shape, untranslated values, stale keys
+with no English source left in the code, placeholder parity and complete
+plural families.
+
+🤖 Generated with Codebuff
+Co-Authored-By: Codebuff <noreply@codebuff.com>
+---
+ cli/src/i18n/__tests__/i18n.test.ts           | 331 +++++++++++++++++
+ cli/src/i18n/__tests__/locale-catalog.test.ts | 343 ++++++++++++++++++
+ 2 files changed, 674 insertions(+)
+ create mode 100644 cli/src/i18n/__tests__/i18n.test.ts
+ create mode 100644 cli/src/i18n/__tests__/locale-catalog.test.ts
+
+diff --git a/cli/src/i18n/__tests__/i18n.test.ts b/cli/src/i18n/__tests__/i18n.test.ts
+new file mode 100644
+index 00000000..7bbf167e
+--- /dev/null
++++ b/cli/src/i18n/__tests__/i18n.test.ts
+@@ -0,0 +1,331 @@
++import fs from 'fs'
++import os from 'os'
++import path from 'path'
++
++import {
++  afterEach,
++  beforeAll,
++  afterAll,
++  describe,
++  expect,
++  spyOn,
++  test,
++} from 'bun:test'
++
++import { detectLocaleFromEnvironment } from '../detect'
++import {
++  formatDate,
++  formatNumber,
++  getLocale,
++  initLocale,
++  isLocaleInitialized,
++  parseLocale,
++  resetLocaleForTests,
++  setLocale,
++  t,
++  tp,
++} from '../index'
++import {
++  DEFAULT_LOCALE,
++  LOCALE_LABELS,
++  SUPPORTED_LOCALES,
++  type Locale,
++} from '../types'
++
++import * as auth from '../../utils/auth'
++
++/**
++ * The suite pins the locale itself: these tests are the contract for
++ * `t()`/`tp()`, so they must not depend on the machine that runs them. That is
++ * also why production code only ever initializes the locale explicitly
++ * (`initLocale` at startup) — nothing here calls it implicitly.
++ */
++
++const ENV_KEYS = [
++  'FREEBUFF_LOCALE',
++  'CODEBUFF_LOCALE',
++  'LC_ALL',
++  'LC_MESSAGES',
++  'LANG',
++] as const
++
++const originalEnv: Record<string, string | undefined> = {}
++
++/** Set the locale-related env vars, remembering what was there before. */
++const setEnv = (
++  values: Partial<Record<(typeof ENV_KEYS)[number], string>>,
++): void => {
++  for (const key of ENV_KEYS) {
++    if (!(key in originalEnv)) originalEnv[key] = process.env[key]
++    const value = values[key]
++    if (value === undefined) delete process.env[key]
++    else process.env[key] = value
++  }
++}
++
++const restoreEnv = (): void => {
++  for (const key of ENV_KEYS) {
++    const value = originalEnv[key]
++    if (value === undefined) delete process.env[key]
++    else process.env[key] = value
++    delete originalEnv[key]
++  }
++}
++
++let testConfigDir: string | undefined
++let getConfigDirSpy: ReturnType<typeof spyOn> | undefined
++
++/**
++ * Every test in this file gets a throwaway config dir for the WHOLE file, not
++ * per test: `setLocale()` and `loadSettings()` both touch the settings file, so
++ * without this a unit test would read and rewrite the developer's real
++ * `settings.json` (and leave a `language` pick behind it).
++ */
++beforeAll(() => {
++  testConfigDir = fs.mkdtempSync(path.join(os.tmpdir(), 'freebuff-i18n-test-'))
++  getConfigDirSpy = spyOn(auth, 'getConfigDir').mockReturnValue(testConfigDir)
++})
++
++afterAll(() => {
++  getConfigDirSpy?.mockRestore()
++  getConfigDirSpy = undefined
++  if (testConfigDir) {
++    fs.rmSync(testConfigDir, { recursive: true, force: true })
++    testConfigDir = undefined
++  }
++})
++
++/** Fails fast when the temp config dir from beforeAll is gone. */
++const freshSettings = (): void => {
++  if (!testConfigDir) {
++    throw new Error('temp config dir missing — beforeAll did not run')
++  }
++}
++
++const writeSettings = (settings: Record<string, unknown>): void => {
++  freshSettings()
++  fs.writeFileSync(
++    path.join(testConfigDir!, 'settings.json'),
++    JSON.stringify(settings, null, 2),
++  )
++}
++
++const readSettings = (): Record<string, unknown> =>
++  JSON.parse(
++    fs.readFileSync(path.join(testConfigDir!, 'settings.json'), 'utf8'),
++  )
++
++afterEach(() => {
++  resetLocaleForTests()
++  // Start every test from "no settings file": a pick persisted by an earlier
++  // test must not be visible to the next one.
++  if (testConfigDir) {
++    fs.rmSync(path.join(testConfigDir, 'settings.json'), { force: true })
++  }
++  restoreEnv()
++})
++
++describe('locale metadata', () => {
++  test('ships exactly the locales the CLI advertises', () => {
++    expect([...SUPPORTED_LOCALES]).toEqual(['en', 'ru'])
++    expect(DEFAULT_LOCALE).toBe('en')
++    expect(LOCALE_LABELS.en).toBe('English')
++    expect(LOCALE_LABELS.ru).toBe('Русский')
++  })
++})
++
++describe('t()', () => {
++  test('renders the English fallback by default', () => {
++    expect(getLocale()).toBe('en')
++    expect(t('any.key', 'English text')).toBe('English text')
++  })
++
++  test('renders the Russian catalog under the ru locale', () => {
++    setLocale('ru')
++    expect(t('help.title', 'Keyboard shortcuts')).toBe('Горячие клавиши')
++  })
++
++  test('falls back to English for a key the catalog does not have', () => {
++    setLocale('ru')
++    expect(t('not.a.real.key', 'English text')).toBe('English text')
++  })
++
++  test('interpolates {name} and {{name}} with identical token names', () => {
++    expect(t('a', 'Hello {name}!', { name: 'Ada' })).toBe('Hello Ada!')
++    expect(t('b', 'Hello {{name}}!', { name: 'Ada' })).toBe('Hello Ada!')
++    setLocale('ru')
++    expect(
++      t('lang.changed', 'Язык интерфейса переключён на {name} ({locale}).', {
++        name: 'Русский',
++        locale: 'ru',
++      }),
++    ).toBe('Язык интерфейса переключён на Русский (ru).')
++  })
++
++  test('leaves a placeholder with no value untouched', () => {
++    expect(t('a', 'Missing {name} stays')).toBe('Missing {name} stays')
++    expect(t('a', 'Missing {name} stays', { other: 'x' })).toBe(
++      'Missing {name} stays',
++    )
++  })
++
++  test('never rewrites ${...}, %s/%d or braces used as literal text', () => {
++    expect(t('a', 'Runs ${x} and %s and %d', { x: '1' })).toBe(
++      'Runs ${x} and %s and %d',
++    )
++    expect(t('b', 'JSON {"a": 1}', { a: 'nope' })).toBe('JSON {"a": 1}')
++  })
++
++  test('keeps line breaks and markup intact in both locales', () => {
++    const source = 'First line\nSecond <b>line</b>'
++    expect(t('a', source)).toBe(source)
++    setLocale('ru')
++    expect(t('a', source)).toBe(source)
++  })
++})
++
++describe('tp()', () => {
++  const forms = { one: '{count} file', other: '{count} files' }
++
++  test('uses English one/other under the en locale', () => {
++    expect(tp('files.count', 1, forms)).toBe('1 file')
++    expect(tp('files.count', 2, forms)).toBe('2 files')
++  })
++
++  test('uses all four Russian plural categories', () => {
++    setLocale('ru')
++    expect(tp('ru.demo', 1, forms)).toBe('1 файл')
++    expect(tp('ru.demo', 2, forms)).toBe('2 файла')
++    expect(tp('ru.demo', 5, forms)).toBe('5 файлов')
++    expect(tp('ru.demo', 0, forms)).toBe('0 файлов')
++    expect(tp('ru.demo', 1.5, forms)).toBe('1,5 файла')
++  })
++
++  test('falls back to the English forms when the catalog has no entry', () => {
++    setLocale('ru')
++    expect(tp('nothing.here', 3, forms)).toBe('3 files')
++  })
++
++  test('always exposes {count} alongside caller params', () => {
++    expect(
++      tp('files.count', 7, { other: '{count} of {total}' }, { total: 9 }),
++    ).toBe('7 of 9')
++  })
++})
++
++const PARSE_CASES: [input: string, expected: Locale | undefined][] = [
++  ['ru', 'ru'],
++  ['RU', 'ru'],
++  ['ru-RU', 'ru'],
++  ['ru_RU.UTF-8', 'ru'],
++  ['en', 'en'],
++  ['EN-US', 'en'],
++  ['fr', undefined],
++  ['', undefined],
++  ['русский', undefined],
++]
++
++describe('parseLocale()', () => {
++  test.each(PARSE_CASES)('parses %s as %s', (value, expected) => {
++    expect(parseLocale(value)).toBe(expected)
++  })
++})
++
++describe('detectLocaleFromEnvironment()', () => {
++  test('reads the explicit override first', () => {
++    setEnv({ FREEBUFF_LOCALE: 'ru', LANG: 'en_US.UTF-8' })
++    expect(detectLocaleFromEnvironment()).toBe('ru')
++  })
++
++  test('reads a POSIX LANG tag', () => {
++    setEnv({ LANG: 'ru_RU.UTF-8' })
++    expect(detectLocaleFromEnvironment()).toBe('ru')
++  })
++
++  test('lets LC_ALL override a ru-flavoured LANG', () => {
++    setEnv({ LC_ALL: 'en_US.UTF-8', LANG: 'ru_RU.UTF-8' })
++    expect(detectLocaleFromEnvironment()).toBe('en')
++  })
++
++  test('treats C/POSIX as "no answer" rather than a language', () => {
++    setEnv({ LC_ALL: 'C', LANG: 'ru_RU.UTF-8' })
++    expect(detectLocaleFromEnvironment()).toBe('ru')
++  })
++
++  test('falls back to the ICU system locale when no env var is set', () => {
++    setEnv({})
++    // With nothing exported there is no POSIX answer, so detection reads
++    // Intl's resolved locale — and must still land on a supported language.
++    const icu = Intl.DateTimeFormat().resolvedOptions().locale.toLowerCase()
++    expect(detectLocaleFromEnvironment()).toBe(
++      icu.startsWith('ru') ? 'ru' : 'en',
++    )
++  })
++})
++
++describe('initLocale()', () => {
++  test('prefers the saved /language choice over the environment', () => {
++    setEnv({ LANG: 'en_US.UTF-8' })
++    writeSettings({ language: 'ru' })
++
++    expect(initLocale()).toBe('ru')
++  })
++
++  test('auto-detects when nothing is saved, without writing a choice back', () => {
++    setEnv({ LANG: 'ru_RU.UTF-8' })
++
++    expect(initLocale()).toBe('ru')
++    expect(readSettings().language).toBeUndefined()
++  })
++
++  test('a saved choice is never overwritten by a later init', () => {
++    writeSettings({ language: 'en' })
++    expect(initLocale()).toBe('en')
++
++    setEnv({ LANG: 'ru_RU.UTF-8' })
++    expect(initLocale()).toBe('en')
++  })
++
++  test('setLocale persists the choice so it survives restarts', () => {
++    initLocale()
++    setLocale('ru')
++
++    expect(readSettings().language).toBe('ru')
++    expect(getLocale()).toBe('ru')
++  })
++
++  test('drops a language this build cannot serve', () => {
++    writeSettings({ language: 'fr' })
++
++    expect(initLocale()).toBe('en')
++  })
++
++  test('reports initialization and is idempotent', () => {
++    expect(isLocaleInitialized()).toBe(false)
++    initLocale()
++    expect(isLocaleInitialized()).toBe(true)
++    expect(initLocale()).toBe(getLocale())
++  })
++})
++
++describe('Intl formatters', () => {
++  test('formatNumber follows the active locale', () => {
++    expect(formatNumber(1234.5)).toBe('1,234.5')
++    setLocale('ru')
++    const ru = formatNumber(1234.5)
++    expect(ru).toContain(',')
++    expect(ru).not.toContain('.')
++  })
++
++  test('formatDate follows the active locale', () => {
++    const moment = Date.UTC(2026, 9, 26, 12, 0, 0)
++    expect(formatDate(moment, { timeZone: 'UTC', month: 'long' })).toBe(
++      'October',
++    )
++
++    setLocale('ru')
++    expect(
++      formatDate(moment, { timeZone: 'UTC', month: 'long', day: 'numeric' }),
++    ).toBe('26 октября')
++  })
++})
+diff --git a/cli/src/i18n/__tests__/locale-catalog.test.ts b/cli/src/i18n/__tests__/locale-catalog.test.ts
+new file mode 100644
+index 00000000..4461e639
+--- /dev/null
++++ b/cli/src/i18n/__tests__/locale-catalog.test.ts
+@@ -0,0 +1,343 @@
++import fs from 'fs'
++import path from 'path'
++
++import { describe, expect, test } from 'bun:test'
++
++import { RU_MESSAGES } from '../locales/ru'
++
++/**
++ * Quality gate for the Russian catalog.
++ *
++ * English is NOT stored in the catalog — it lives at each call site as the
++ * `fallback` argument (or as `tp()`'s inline English forms) and is what renders
++ * under the default `en` locale. That makes the code the single source of
++ * truth for English, so this suite reads the source back and checks the
++ * catalog against it:
++ *
++ *  1. no duplicate keys (an object literal would silently keep the last one),
++ *  2. well-formed, namespaced keys,
++ *  3. every value actually contains Russian (a copy-pasted English string
++ *     that slipped in as a "translation"),
++ *  4. every key still has English in the code — a stale key for a string that
++ *     no longer exists fails loudly,
++ *  5. placeholder parity with that English ({name} / {{name}} / %s / ${...}),
++ *  6. complete Russian plural families (one / few / many / other).
++ *
++ * "Missing key" is a different failure mode and is covered by i18n.test.ts: a
++ * key absent from the catalog must render its English fallback, never an empty
++ * string or the raw key.
++ */
++
++const I18N_DIR = path.resolve(import.meta.dir, '..')
++const CLI_SRC = path.resolve(I18N_DIR, '..')
++
++const RU_SOURCE = fs.readFileSync(
++  path.join(I18N_DIR, 'locales', 'ru.ts'),
++  'utf8',
++)
++
++/** Every non-test .ts/.tsx file under cli/src: test files are excluded so an
++ *  assertion that happens to quote a string cannot masquerade as the English
++ *  source of a catalog key. Keys used ONLY by tests are listed in
++ *  TEST_FIXTURE_KEYS below. */
++const listSourceFiles = (dir: string): string[] => {
++  const out: string[] = []
++  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
++    const full = path.join(dir, entry.name)
++    if (entry.isDirectory()) {
++      if (entry.name === 'node_modules' || entry.name === 'dist') continue
++      out.push(...listSourceFiles(full))
++    } else if (
++      /\.tsx?$/.test(entry.name) &&
++      !/\.test\.tsx?$/.test(entry.name)
++    ) {
++      out.push(full)
++    }
++  }
++  return out
++}
++
++/** Catalog keys with no production call site because they exist only to
++ *  exercise the runtime (i18n.test.ts). Checked for shape, skipped for
++ *  coverage and placeholder parity. */
++const TEST_FIXTURE_KEYS = new Set(['ru.demo'])
++const isFixture = (key: string): boolean =>
++  TEST_FIXTURE_KEYS.has(key) ||
++  [...TEST_FIXTURE_KEYS].some((base) => key.startsWith(`${base}.`))
++
++const SOURCE_FILES = listSourceFiles(CLI_SRC)
++const SOURCE_OF = new Map<string, string>(
++  SOURCE_FILES.map((file) => [file, fs.readFileSync(file, 'utf8')]),
++)
++const ALL_SOURCE = [...SOURCE_OF.values()].join('\n')
++
++const readRelative = (relative: string): string =>
++  fs.readFileSync(path.join(CLI_SRC, relative), 'utf8')
++
++/** Placeholder names in a template, both `{x}` and `{{x}}`. */
++const placeholders = (template: string): Set<string> => {
++  const found = new Set<string>()
++  for (const match of template.matchAll(
++    /\{\{([A-Za-z0-9_]+)\}\}|\{([A-Za-z0-9_]+)\}/g,
++  )) {
++    found.add((match[1] ?? match[2]) as string)
++  }
++  return found
++}
++
++const samePlaceholders = (a: Set<string>, b: Set<string>): boolean =>
++  a.size === b.size && [...a].every((token) => b.has(token))
++
++// --- English source lookup -------------------------------------------------
++
++/** `t('key', 'English…')` calls, tolerating either quote style and newlines
++ *  between the arguments. */
++const literalCalls = (): Map<string, string> => {
++  const found = new Map<string, string>()
++  const pattern =
++    /\bt\(\s*(['"])((?:\\.|(?!\1)[^\\])*)\1\s*,\s*(['"])((?:\\.|(?!\3)[^\\])*)\3/g
++  for (const [, , key, , fallback] of ALL_SOURCE.matchAll(pattern)) {
++    if (!found.has(key)) found.set(key, fallback)
++  }
++  return found
++}
++
++/** Extract the full text of `tp(\n  '<base>' …)` so its English forms can be
++ *  read. Whitespace between `tp(` and the key is tolerated because the call
++ *  site may be wrapped over several lines. */
++const findTpCall = (base: string): string | null => {
++  const escaped = base.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
++  const open = new RegExp(String.raw`tp\(\s*'${escaped}'`)
++  const from = ALL_SOURCE.search(open)
++  if (from === -1) return null
++
++  let depth = 0
++  let quote: string | null = null
++  for (let i = from + 2; i < ALL_SOURCE.length; i++) {
++    const char = ALL_SOURCE[i] as string
++    if (quote) {
++      if (char === '\\') {
++        i++
++        continue
++      }
++      if (char === quote) quote = null
++      continue
++    }
++    if (char === "'" || char === '"') {
++      quote = char
++      continue
++    }
++    if (char === '(') depth++
++    else if (char === ')') {
++      depth--
++      if (depth === 0) return ALL_SOURCE.slice(from, i + 1)
++    }
++  }
++  return null
++}
++
++/** `cmd.<id>.description` → the `description:` literal for that id. */
++const slashCommandDescriptions = (): Map<string, string> => {
++  const source = readRelative('data/slash-commands.ts')
++  const found = new Map<string, string>()
++  const pattern =
++    /\bid:\s*'([^']+)'[\s\S]*?\bdescription:\s*(?:'((?:\\.|[^'\\])*)'|"((?:\\.|[^"\\])*)")/g
++  for (const match of source.matchAll(pattern)) {
++    found.set(`cmd.${match[1]}.description`, (match[2] ?? match[3]) as string)
++  }
++  return found
++}
++
++/** `input.mode.<mode>.<field>` → the English `label`/`placeholder`. */
++const inputModeStrings = (): Map<string, string> => {
++  const source = readRelative('utils/input-modes.ts')
++  const found = new Map<string, string>()
++  for (const match of source.matchAll(/^  (\w+): \{([\s\S]*?)^  \},?$/gm)) {
++    const mode = (match[1] as string).toLowerCase()
++    const body = match[2] as string
++    const label = body.match(/\blabel:\s*'((?:\\.|[^'\\])*)'/)
++    const placeholder = body.match(/\bplaceholder:\s*'((?:\\.|[^'\\])*)'/)
++    if (label) found.set(`input.mode.${mode}.label`, label[1] as string)
++    if (placeholder) {
++      found.set(`input.mode.${mode}.placeholder`, placeholder[1] as string)
++    }
++  }
++  return found
++}
++
++/** `help.section.<k>` and `help.<section>.<row>` → English copy in SECTIONS. */
++const helpBannerStrings = (): Map<string, string> => {
++  const source = readRelative('components/help-banner.tsx')
++  const marks: { index: number; key: string; text: string }[] = []
++
++  for (const match of source.matchAll(
++    /\bkey:\s*'([a-z-]+)',\s*\n\s*title:\s*'([^']*)'/g,
++  )) {
++    marks.push({
++      index: match.index ?? 0,
++      key: `help.section.${match[1]}`,
++      text: match[2] as string,
++    })
++  }
++  // No trailing comma in the pattern: a one-line row closes with ` },` so the
++  // comma sits after the brace, while a wrapped row does have one after the
++  // text. Requiring it hid every one-line row from this scan.
++  for (const match of source.matchAll(
++    /\bkey:\s*'([a-z-]+)',\s*\n?\s*text:\s*'([^']*)'/g,
++  )) {
++    marks.push({
++      index: match.index ?? 0,
++      key: `__row__${match[1]}`,
++      text: match[2] as string,
++    })
++  }
++
++  marks.sort((a, b) => a.index - b.index)
++  const found = new Map<string, string>()
++  let section: string | null = null
++  for (const mark of marks) {
++    if (mark.key.startsWith('help.section.')) {
++      section = mark.key.slice('help.section.'.length)
++      found.set(mark.key, mark.text)
++    } else if (section) {
++      found.set(
++        `help.${section}.${mark.key.slice('__row__'.length)}`,
++        mark.text,
++      )
++    }
++  }
++  return found
++}
++
++const LITERAL_CALLS = literalCalls()
++const SLASH_DESCRIPTIONS = slashCommandDescriptions()
++const INPUT_MODE_STRINGS = inputModeStrings()
++const HELP_STRINGS = helpBannerStrings()
++
++const PLURAL_SUFFIX = /\.(one|few|many|other)$/
++
++/** English text backing a catalog key, or null when it cannot be found —
++ *  which for a catalog key means the key is stale. */
++const englishFor = (key: string): string | null => {
++  const literal = LITERAL_CALLS.get(key)
++  if (literal !== undefined) return literal
++
++  const plural = key.match(PLURAL_SUFFIX)
++  if (plural) {
++    const call = findTpCall(key.slice(0, plural.index ?? key.length))
++    return call
++  }
++
++  return (
++    SLASH_DESCRIPTIONS.get(key) ??
++    INPUT_MODE_STRINGS.get(key) ??
++    HELP_STRINGS.get(key) ??
++    null
++  )
++}
++
++// --- the suite -------------------------------------------------------------
++
++describe('ru catalog: shape', () => {
++  const declared = [...RU_SOURCE.matchAll(/^\s*'([^']+)':/gm)].map(
++    (match) => match[1] as string,
++  )
++
++  test('declares no key twice (the object literal would hide it)', () => {
++    const duplicates = declared.filter(
++      (key, index) => declared.indexOf(key) !== index,
++    )
++    expect([...new Set(duplicates)]).toEqual([])
++  })
++
++  test('source and runtime agree on how many keys there are', () => {
++    expect(declared.length).toBe(Object.keys(RU_MESSAGES).length)
++  })
++
++  test('every key is namespaced and lower-case', () => {
++    const malformed = Object.keys(RU_MESSAGES).filter(
++      (key) => !/^[a-z][a-z0-9]*(\.[a-z0-9:_-]+)+$/.test(key),
++    )
++    expect(malformed).toEqual([])
++  })
++
++  test('every value is actually Russian', () => {
++    const untranslated = Object.entries(RU_MESSAGES)
++      .filter(([, value]) => !/[а-яё]/i.test(value))
++      .map(([key]) => key)
++    expect(untranslated).toEqual([])
++  })
++})
++
++describe('ru catalog: coverage against the code', () => {
++  const keys = Object.keys(RU_MESSAGES)
++
++  test('every key still has English in the code (no stale keys)', () => {
++    const stale = keys
++      .filter((key) => !isFixture(key))
++      .filter((key) => englishFor(key) === null)
++    expect(stale).toEqual([])
++  })
++
++  test('every key maps to a usable English string', () => {
++    const empty = keys
++      .filter((key) => !isFixture(key))
++      .filter((key) => (englishFor(key) ?? '').length === 0)
++    expect(empty).toEqual([])
++  })
++})
++
++describe('ru catalog: placeholders', () => {
++  const keys = Object.keys(RU_MESSAGES)
++
++  test('placeholders match the English source one-for-one', () => {
++    const mismatches: { key: string; english: string[]; russian: string[] }[] =
++      []
++
++    for (const key of keys) {
++      if (isFixture(key)) continue
++      const english = englishFor(key)
++      if (english === null) continue // reported by the coverage suite
++      const russian = RU_MESSAGES[key] as string
++      if (!samePlaceholders(placeholders(english), placeholders(russian))) {
++        mismatches.push({
++          key,
++          english: [...placeholders(english)],
++          russian: [...placeholders(russian)],
++        })
++      }
++    }
++
++    expect(mismatches).toEqual([])
++  })
++})
++
++describe('ru catalog: pluralization', () => {
++  const pluralBases = [
++    ...new Set(
++      Object.keys(RU_MESSAGES)
++        .filter((key) => PLURAL_SUFFIX.test(key))
++        .map((key) => key.replace(PLURAL_SUFFIX, '')),
++    ),
++  ]
++
++  test('has at least one pluralized string to prove the mechanism', () => {
++    expect(pluralBases.length).toBeGreaterThan(0)
++  })
++
++  test('every pluralized key ships all four Russian forms', () => {
++    const incomplete = pluralBases.filter((base) =>
++      ['one', 'few', 'many', 'other'].some(
++        (form) => !(`${base}.${form}` in RU_MESSAGES),
++      ),
++    )
++    expect(incomplete).toEqual([])
++  })
++
++  test('every base key with Russian plural forms is called through tp()', () => {
++    const unused = pluralBases
++      .filter((base) => !isFixture(base))
++      .filter((base) => findTpCall(base) === null)
++    expect(unused).toEqual([])
++  })
++})
+-- 
+2.43.0
+
+
+From 02268984328d40fa179697f159b0ef68e830d15a Mon Sep 17 00:00:00 2001
+From: Freebuff <cloud@freebuff.local>
+Date: Mon, 26 Oct 2026 03:01:16 +0000
+Subject: [PATCH 5/5] docs: add Russian localization README and glossary
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Documents how to apply the patch, switch languages, build and test, what is
+and is not translated, the known limits of this snapshot's tooling, and the
+Apache-2.0 obligations that come with redistributing a Russian fork.
+
+🤖 Generated with Codebuff
+Co-Authored-By: Codebuff <noreply@codebuff.com>
+---
+ GLOSSARY_RU.md |  90 ++++++++++++++++++++
+ README_RU.md   | 218 +++++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 308 insertions(+)
+ create mode 100644 GLOSSARY_RU.md
+ create mode 100644 README_RU.md
+
+diff --git a/GLOSSARY_RU.md b/GLOSSARY_RU.md
+new file mode 100644
+index 00000000..8d7c4cdc
+--- /dev/null
++++ b/GLOSSARY_RU.md
+@@ -0,0 +1,90 @@
++# Глоссарий русской локализации Freebuff (ru-RU)
++
++Единый справочник терминов для каталога `cli/src/i18n/locales/ru.ts`.
++Любая новая строка обязана следовать этому файлу; если термина здесь нет —
++добавьте его в тот же PR, а не придумывайте перевод на месте.
++
++Правила, из которых вытекает таблица:
++
++1. **Переводится только то, что видит пользователь**: подписи, кнопки, меню,
++   диалоги, подсказки, сообщения об ошибках, системные уведомления.
++2. **Не переводится**: код, идентификаторы, имена файлов, пути, URL,
++   CLI-команды и их алиасы, имена моделей и провайдеров, бренды, ключи API,
++   технические логи, строки для разработчиков, содержимое `SKILL.md`
++   (это контент проекта, а не интерфейс).
++3. **Плейсхолдеры и разметка копируются буквально**: `{name}`, `{{name}}`,
++   `%s`, `%d`, `${...}`, HTML-теги, Markdown, экранирование, переносы строк.
++   Имя плейсхолдера на русском не меняется — меняется только текст вокруг.
++4. **Множественное число** задаётся четырьмя формами
++   `key.one` / `key.few` / `key.many` / `key.other` и выбирается через
++   `Intl.PluralRules('ru')`: 1 файл, 2 файла, 5 файлов, 1,5 файла.
++5. **Типографика**: пишем «ё» полностью («часто», «ещё»), кавычки `«…»`,
++   тире `—` (с пробелами), многоточие `…` одним символом. Сокращения клавиш
++   (`Ctrl+C`, `Esc`, `Enter`, `Tab`) остаются как есть.
++
++## Согласованные термины
++
++| English                | Русский             | Примечание                                                |
++| ---------------------- | ------------------- | --------------------------------------------------------- |
++| agent                  | агент               | `@agents`, суб-агент — «вложенный агент»                  |
++| API key                | API-ключ            | Буквы API не склоняем и не переводим                      |
++| bash / shell           | bash / оболочка     | «команда в оболочке»; само слово `bash` не переводим      |
++| build                  | сборка              |                                                           |
++| cache                  | кеш                 |                                                           |
++| catalog                | каталог             |                                                           |
++| CLI                    | CLI                 | Аббревиатура остаётся                                     |
++| clipboard              | буфер обмена        |                                                           |
++| commit                 | коммит              | глагол: «закоммитить» / «ничего не закоммичено»           |
++| composer (input)       | поле ввода          |                                                           |
++| conversation           | беседа              | Единое слово: и раздел справки, и тост `/copy`            |
++| credits                | кредиты             | «баланс кредитов»                                         |
++| fallback               | резервный вариант   | В коде — технический термин, не переводится               |
++| feature                | фича                | Устоявшееся в среде разработчиков                         |
++| file                   | файл                |                                                           |
++| hint / placeholder     | подсказка           | «подсказка в поле ввода», не «плейсхолдер»                |
++| input mode             | режим ввода         |                                                           |
++| key binding / shortcut | горячая клавиша     |                                                           |
++| language / locale      | язык                |                                                           |
++| message                | сообщение           |                                                           |
++| model                  | модель              | Названия моделей не переводим: DeepSeek, MiMo, GLM        |
++| model provider         | провайдер           |                                                           |
++| notice / banner        | баннер              |                                                           |
++| prompt                 | запрос              | «промпт» — только если речь о system prompt как артефакте |
++| provider               | провайдер           |                                                           |
++| pull request           | пул-реквест         |                                                           |
++| queue / queued         | очередь / отложено  | «3 сообщения отложено»                                    |
++| reasoning effort       | уровень рассуждений |                                                           |
++| session                | сессия              |                                                           |
++| setting                | настройка           |                                                           |
++| skill                  | навык               | Бейдж режима «Навык»; имя скилла не переводим             |
++| streaming              | стриминг            | В статусе — «работаем…», не «стриминг…»                   |
++| token                  | токен               |                                                           |
++| tool call              | вызов инструмента   |                                                           |
++
++## Термины, которые намеренно остаются на английском
++
++| Термин                                                      | Почему                                                                           |
++| ----------------------------------------------------------- | -------------------------------------------------------------------------------- |
++| Freebuff, Codebuff, Freebucks                               | Бренды и названия продуктов                                                      |
++| `CLI`, `API`, `URL`, `JSON`, `YAML`, `Markdown`, `OSC 52`   | Аббревиатуры и форматы                                                           |
++| `bash`, `Enter`, `Esc`, `Ctrl+C`, `Ctrl+V`, `Tab`           | Имена команд и клавиш: их нельзя переводить, иначе инструкция перестаёт работать |
++| `BYOK`                                                      | Отраслевая аббревиатура (Bring Your Own Key)                                     |
++| OpenRouter, OpenAI-compatible, названия моделей             | Имена собственные и технические идентификаторы провайдеров                       |
++| идентификаторы вида `skill:interview`, `/language`, `ru-RU` | Ключи, команды и теги локалей                                                    |
++
++## Соглашения по коду
++
++- Английский текст живёт **на месте вызова** как fallback:
++  `t('help.title', 'Keyboard shortcuts')`. Каталог `ru.ts` хранит только
++  русские переопределения, поэтому отсутствующий ключ автоматически
++  отдаёт английский — пустых строк и «сырых» ключей в UI не бывает.
++- Ключи — плоские, точечные, в нижнем регистре: `раздел.подраздел.поле`.
++  Семейства: `cmd.*`, `help.*`, `input.mode.*`, `login.*`, `status.*`,
++  `toast.*`, `queue.*`, `copy.*`, `lang.*`, `feedback.*`, `proposal.*`.
++- Русский текст обязан содержать кирилицу — проверка
++  `i18n/__tests__/locale-catalog.test.ts` ловит случайно скопированный
++  английский оригинал.
++- Числа и даты в новых строках форматируются через `Intl`
++  (`formatNumber`, `formatDate`); счётчики во множественном числе —
++  через `tp()`, который подставляет `{count}` в локальном виде
++  (`1 234 сообщения`, `1,5 файла`).
+diff --git a/README_RU.md b/README_RU.md
+new file mode 100644
+index 00000000..d7edd23e
+--- /dev/null
++++ b/README_RU.md
+@@ -0,0 +1,218 @@
++# Русская локализация Freebuff CLI (ru-RU)
++
++Патч добавляет русский язык в интерфейс Freebuff CLI: справку, меню
++слеш-команд, статус-строку, поле ввода, экран входа, уведомления и системные
++сообщения. Английский и китайская документация (`README.zh-CN.md`) не
++тронуты, отсутствующие ключи продолжают отдавать английский текст.
++
++- Ветка: `feat/i18n-ru`
++- Патч: `freebuff-ru-localization.patch`
++- Архив: `freebuff-ru-localization.zip`
++- Глоссарий: [GLOSSARY_RU.md](./GLOSSARY_RU.md)
++
++## 1. Как применить патч
++
++Из корня репозитория, на чистом рабочем дереве:
++
++```bash
++git apply freebuff-ru-localization.patch        # вариант 1: как один патч
++# или, чтобы сохранить авторские коммиты:
++git am freebuff-ru-localization.patch           # вариант 2
++```
++
++Альтернатива — архив:
++
++```bash
++unzip freebuff-ru-localization.zip -d .          # файлы встают по своим путям
++```
++
++Если конфликт (локализация сделана по `origin/main` от 2026-10):
++
++```bash
++git apply --3way freebuff-ru-localization.patch
++```
++
++## 2. Как включить русский язык
++
++Три способа, по приоритету:
++
++1. **Команда в CLI** — сохраняется и переживает перезапуск:
++
++   ```
++   /language          # текущий язык и список доступных
++   /language ru       # переключить на русский (алиасы: /lang, /locale)
++   /language en       # вернуть английский
++   ```
++
++2. **Автодетект** — срабатывает только если язык никогда не выбирали
++   вручную: `LANG`, `LC_ALL` или `LC_MESSAGES`, начинающиеся с `ru`
++   (например `ru_RU.UTF-8`). Выбор пользователя всегда сильнее окружения.
++
++3. **Переменная окружения** — явное принуждение, удобно для CI и баг-репортов:
++
++   ```bash
++   FREEBUFF_LOCALE=ru freebuff
++   ```
++
++Выбранное значение пишется полем `language` в `settings.json` каталога
++конфигурации CLI (путь см. `getConfigDir()`, переопределяется
++`FREEBUFF_CONFIG_DIR`).
++
++## 3. Как собрать и запустить
++
++```bash
++bun install          # bun 1.3.14, lockfile не меняется
++bun run dev          # dev-режим CLI (TUI)
++bun run dev:freebuff # то же в Freebuff-режиме
++bun run ci           # сборка sdk + freebuff
++cd cli && bun run typecheck
++```
++
++Проверка локализации:
++
++```bash
++# из КОРНЯ репозитория (см. «Известные ограничения»)
++bun test cli/src/i18n/__tests__/
++```
++
++## 4. Как это устроено
++
++Решение минимальное: **новых зависимостей не добавлено ни одной** — только
++`zustand`, который в проекте уже есть.
++
++| Файл                                   | Роль                                                                                                                                                                            |
++| -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
++| `cli/src/i18n/index.ts`                | Ядро: `t(key, english, params)` — перевод с fallback, `tp()` — множественное число, `formatNumber`/`formatDate` на `Intl`, `useT()` — подписка React-компонентов на смену языка |
++| `cli/src/i18n/types.ts`                | Тип `Locale`, список и подписи языков                                                                                                                                           |
++| `cli/src/i18n/detect.ts`               | Автодетект из окружения и `Intl`                                                                                                                                                |
++| `cli/src/i18n/locales/ru.ts`           | Каталог ru-RU: 135 плоских ключей                                                                                                                                               |
++| `cli/src/utils/settings.ts`            | Хранение выбора (`language`), allowlist-валидация                                                                                                                               |
++| `cli/src/index.tsx`                    | `initLocale()` при старте                                                                                                                                                       |
++| `cli/src/commands/command-registry.ts` | Команда `/language`                                                                                                                                                             |
++| `cli/src/i18n/__tests__/`              | 44 теста: ядро + проверка каталога                                                                                                                                              |
++
++Ключевые свойства:
++
++- **Английский живёт в коде**, в точке вызова: `t('help.title', 'Keyboard
++shortcuts')`. Каталог хранит только русские переопределения, поэтому
++  _отсутствующий ключ = английский текст_. Пустых строк и сырых ключей в UI
++  не бывает.
++- **Локаль по умолчанию `en`** и инициализируется только явно при старте —
++  поэтому тесты, проверяющие английские строки, детерминированы на любой
++  машине.
++- **Множественное число по CLDR**: `one / few / many / other` через
++  `Intl.PluralRules('ru')` — «1 сообщение», «2 сообщения», «5 сообщений»,
++  «1,5 файла».
++- **Плейсхолдеры не трогаются**: `{name}`, `{{name}}` подставляются,
++  `${...}`, `%s`, `%d`, HTML и Markdown остаются как есть; незаполненный
++  плейсхолдер остаётся видимым, а не превращается в пустую строку.
++
++## 5. Что переведено
++
++135 ключей, 50 вызовов `t()` и 15 вызовов `tp()`:
++
++- меню слеш-команд (все описания команд, `/help`, `/plan`, `/model`, …);
++- оверлей горячих клавиш (разделы «Ввод», «Чат», «Беседа», все подписи);
++- статус-строка: «думаем…», «работаем…», «переподключено», повторы,
++  переполнение очереди, «не удаётся связаться с серверами…»;
++- поле ввода: подсказки всех режимов и бейджи «План», «Проверка»,
++  «Собеседование», «Навык»;
++- экран входа: инструкции, ошибки, кнопка копирования, таймаут;
++- тосты и системные сообщения: ошибка отправки, копирование, `/copy`,
++  `/usage`, обработка вложений;
++- очередь сообщений (заголовок и пауза) и сводка изменённых файлов;
++- новая команда `/language`.
++
++## 6. Что НЕ переведено (и почему)
++
++В CLI около 700 строк текста. Переведена «оболочка» — то, что видно в первые
++десять секунд работы и в самых частых сценариях. Остальное сознательно не
++тронуто в этом патче:
++
++- рендеры вызовов инструментов (`components/tools/*`), блоки диалога
++  агентов, панели `todo`/`queue`/`publish`;
++- баннеры подписки и кредитов, рекламные/спонсорские блоки;
++- селектор моделей и picker рассуждений;
++- текстовые выводы команд `/byok`, `/deals`, `/ads:*`, `/diagnostics` —
++  длинные технические инструкции с примерами команд и URL, где машинный
++  перевод легко ломает копируемый текст;
++- содержимое `agents/` (определения агентов) и `SKILL.md` — это контент,
++  а не интерфейс;
++- `README*.md` — документация, не UI.
++
++Причина остановки — не архитектура, а объём: каждую строку нужно перевести
++с сохранением плейсхолдеров и проверить компонентным тестом. Добавление
++следующей порции не требует менять инфраструктуру — достаточно обернуть
++строку в `t()` и добавить ключ.
++
++## 7. Проверки, которые прогнаны
++
++```bash
++bun install --frozen-lockfile        # 670 пакетов, OK
++cd cli && bun run typecheck          # 23 ошибки — БЕЗ моих правок их было 23,
++                                     # вывод побайтово совпадает с базовым
++bun test cli/src/i18n/__tests__/     # 44 pass, 0 fail
++bun test <все 286 тестовых файлов>   # 3453 pass / 66 fail / 56 errors
++bunx prettier --write <изменённые>   # OK
++```
++
++`66 fail / 56 errors` — **предсуществующие и окружные**, не связаны с
++локализацией. Сверено на базовой ревизии теми же командами:
++
++- `release wrapper` (3), `message history persistence` (3) — падают и без
++  патча, причина в запуске из корня и в окружении;
++- `display-ad-served` (2) — падают и без патча (ожидаются `codebuff.com`-URL);
++- `freebuff-model-catalog` (3) и `Unhandled error between tests` в
++  e2e/launcher-файлах — падают только в общем прогоне из-за перекрёстного
++  состояния между файлами; те же файлы рядом с тестами локализации проходят.
++
++Что **не удалось** прогнать и почему:
++
++- `cd cli && bun test` — не стартует ни с патчем, ни без него:
++  `cli/bunfig.toml` ссылается на отсутствующий в этом снапшоте
++  `test/setup-scm-loader.ts`. Отсюда запуск из корня.
++- `eslint` — в `package.json` нет скрипта `lint`, а `eslint.config.js`
++  падает на отсутствующем пакете `globals` (та же проблема снапшота, что и
++  `picocolors` в typecheck). Форматирование проверено `prettier`.
++- Полную базовую сверку всего набора из 286 файлов выполнить не удалось:
++  раннер перезапустился во время `git stash` → прогон → `git stash pop`
++  (работа восстановлена из stash, потерь нет). Сверены все 11 уникальных
++  падений — см. выше.
++
++## 8. Известные ограничения
++
++- Переводятся только строки, обёрнутые в `t()`/`tp()`. Необёрнутый
++  английский в не переведённых файлах (раздел 6) остаётся английским — это
++  осознанный fallback, а не ошибка.
++- Реактивность: компоненты, использующие `useT()`, перерисовываются при
++  смене языка сразу; строковые сообщения в обработчиках команд читают
++  текущую локаль в момент вызова.
++- Автодетект не срабатывает, если язык уже выбирали вручную (так и задумано).
++- Русские строки длиннее английских. Проверено на самых требовательных
++  местах: меню слеш-команд само переходит в двухстрочный режим, бейджи
++  режимов ввода имеют `flexShrink: 0` и расширяются за счёт поля ввода,
++  справка скроллится. На терминале уже 60 символов подписи переносятся по
++  словам.
++- Тест-кейс `ru.demo.*` — фикстура для проверки правил множественного
++  числа, продакшн-вызова не имеет.
++
++## 9. Предупреждение о лицензии
++
++Проект распространяется по **Apache License 2.0** (`LICENSE`), в `NOTICE`
++указано `Codebuff — Copyright 2025 Codebuff`.
++
++- Право на модификацию и распространение производного кода у вас есть:
++  Apache-2.0 это прямо разрешает.
++- При публикации «русификатора» вы обязаны: сохранить файлы `LICENSE` и
++  `NOTICE`, указать, что внесены изменения, и не удалять упоминания
++  авторов. Убрать их — нарушение лицензии.
++- Названия `Freebuff`, `Codebuff`, `Freebucks` — товарные знаки проекта.
++  Использовать их в названии распространяемого патча можно только как
++  описание совместимости («локализация для Freebuff»), а не так, будто она
++  выпущена авторами проекта.
++- Патч не содержит секретов, ключей, токенов и локальных конфигов — он
++  меняет только исходники интерфейса, глоссарий и документацию.
++- Если проект имеет отдельные ToS для hosted-части (бэкенд, сайт), они на
++  этот локальный патч не распространяются: он меняет только клиент CLI.
++  На всякий случай сверьтесь с `SECURITY.md` и условиями сервиса перед
++  публикацией форка.
+-- 
+2.43.0
+
